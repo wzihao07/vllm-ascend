@@ -601,3 +601,33 @@ def test_copy_sfa_host_inputs_never_fall_back_to_device_to_host_copy():
     cm.req_topk_buffer_slots = cm.req_topk_buffer_slots.to("npu")
     with pytest.raises(RuntimeError, match="must be CPU tensors"):
         populate(builder, cm)
+
+
+def test_delayed_d2h_prefix_advances_only_after_published_completion():
+    builder = make_builder()
+    builder.delayed_d2h = True
+    base = 8192
+    cm = common([4], [base + 129], pools=(1,), active=(True,))
+    cm.req_topk_buffer_stable_prefixes = torch.tensor([base], dtype=torch.int32, device="npu")
+
+    before = populate(builder, cm)
+    assert before.copy_sfa_prefix_lens.tolist() == [base]
+    assert before.copy_sfa_logical_lens.tolist() == [base + 129]
+
+    # Only a retired D2H batch publishes the next full-block boundary; until
+    # then the working-table geometry keeps the older stable prefix even
+    # though num_computed_tokens has already moved past it.
+    cm.req_topk_buffer_stable_prefixes.fill_(base + 128)
+    after = populate(builder, cm)
+    assert after.copy_sfa_prefix_lens.tolist() == [base + 128]
+    assert after.copy_sfa_logical_lens.tolist() == [base + 1]
+
+
+def test_delayed_d2h_geometry_requires_runner_owned_stable_prefixes():
+    builder = make_builder()
+    builder.delayed_d2h = True
+    cm = common([4], [10371], pools=(1,), active=(True,))
+    cm.req_topk_buffer_stable_prefixes = None
+
+    with pytest.raises(RuntimeError, match="runner-owned stable prefixes"):
+        populate(builder, cm)

@@ -4204,6 +4204,79 @@ class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):
             runner._correct_optimistic_seq_lens_cpu(1)
 
 
+class TestDelayedD2HRunnerHooks(unittest.TestCase):
+    @staticmethod
+    def _build_runner(plan_count=1):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.sparse_kv_offload_enabled = True
+        runner.sparse_kv_offload_config = SimpleNamespace(delayed_d2h=True)
+        manager = MagicMock()
+        manager.plan_d2h_requests.return_value = plan_count
+        manager.retire_d2h.return_value = 2
+        manager.record_d2h_source_ready.return_value = True
+        manager.d2h_host_kv_cache_group_id = 1
+        runner.sparse_kv_offload_manager = manager
+        runner._offload_pool_slots = SimpleNamespace(np=np.array([3, 1], dtype=np.int32))
+        runner._offload_pool_generations = SimpleNamespace(np=np.array([7, 9], dtype=np.int64))
+        indexer_block_table = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        host_block_table = np.array([[10, 11], [20, 21]], dtype=np.int32)
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=np.array([128, 255], dtype=np.int64),
+            block_table=[
+                SimpleNamespace(get_numpy_array=lambda: indexer_block_table),
+                SimpleNamespace(get_numpy_array=lambda: host_block_table),
+            ],
+        )
+        return runner, manager, host_block_table
+
+    def test_plan_uses_cpu_request_state_and_launches_only_nonempty_batch(self):
+        runner, manager, block_table = self._build_runner()
+
+        self.assertEqual(runner._d2h_plan_and_launch(2), 1)
+
+        args = manager.plan_d2h_requests.call_args.args
+        np.testing.assert_array_equal(args[0], np.array([128, 255]))
+        np.testing.assert_array_equal(args[1], np.array([3, 1]))
+        np.testing.assert_array_equal(args[2], np.array([7, 9]))
+        np.testing.assert_array_equal(args[3], block_table)
+        np.testing.assert_array_equal(args[4], np.ones(2, dtype=np.bool_))
+        manager.launch_d2h.assert_called_once_with()
+
+        runner, manager, _ = self._build_runner(plan_count=0)
+        self.assertEqual(runner._d2h_plan_and_launch(2), 0)
+        manager.launch_d2h.assert_not_called()
+
+    def test_retire_and_source_ready_delegate_to_manager(self):
+        runner, manager, _ = self._build_runner()
+
+        self.assertEqual(runner._d2h_retire(), 2)
+        self.assertTrue(runner._d2h_record_source_ready())
+        manager.retire_d2h.assert_called_once_with()
+        manager.record_d2h_source_ready.assert_called_once_with()
+
+    def test_disabled_hooks_are_noops(self):
+        runner, manager, _ = self._build_runner()
+        runner.sparse_kv_offload_enabled = False
+
+        self.assertEqual(runner._d2h_retire(), 0)
+        self.assertEqual(runner._d2h_plan_and_launch(2), 0)
+        self.assertFalse(runner._d2h_record_source_ready())
+        runner._d2h_reject_preemptions({"req-preempted"})
+        manager.assert_not_called()
+
+    def test_preemption_is_rejected_after_delayed_d2h_is_retired(self):
+        runner, manager, _ = self._build_runner()
+
+        runner._d2h_retire()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "does not support scheduler preemption yet.*req-a, req-b",
+        ):
+            runner._d2h_reject_preemptions({"req-b", "req-a"})
+
+        manager.retire_d2h.assert_called_once_with()
+
+
 class TestKVPPExecute(unittest.TestCase):
     def test_history_gate_uses_only_actual_requests(self):
         from vllm_ascend.worker.v1 import model_runner as module

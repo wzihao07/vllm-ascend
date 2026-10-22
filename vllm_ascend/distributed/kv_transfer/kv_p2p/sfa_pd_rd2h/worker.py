@@ -345,7 +345,7 @@ class SFAPDRD2HConsumerWorker:
         if hasattr(self, "_mf_read_thread") and self._mf_read_thread is not None:
             local_done = self._mf_read_thread.get_and_clear_done()
             local_failed = self._mf_read_thread.get_and_clear_failed()
-        self._terminal_ext_ids.update(local_done | local_failed)
+            self._terminal_ext_ids.update(local_done | local_failed)
 
         local_terminal = set(self._terminal_ext_ids)
         receiver = getattr(self, "_dspark_context_receiver", None)

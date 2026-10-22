@@ -1860,10 +1860,11 @@ class NPUModelRunner(GPUModelRunner):
     def _d2h_reject_preemptions(self, preempted_req_ids) -> None:
         """Fail before state reuse until D2H preemption has a restore protocol."""
         if self._d2h_enabled() and preempted_req_ids:
+            preempted = ", ".join(sorted(preempted_req_ids))
             raise RuntimeError(
                 "delayed D2H does not support scheduler preemption yet; "
                 "preemption resets num_computed_tokens and releases KV blocks "
-                f"without rebuilding resident tails (requests: {preempted_req_ids})"
+                f"without rebuilding resident tails (requests: {preempted})"
             )
 
     def _d2h_plan_and_launch(self, num_reqs: int) -> int:

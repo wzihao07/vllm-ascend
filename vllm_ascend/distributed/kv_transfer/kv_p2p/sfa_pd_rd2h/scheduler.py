@@ -524,8 +524,13 @@ class SFAPDRD2HScheduler:
         if cached is None:
             from vllm_ascend.ascend_config import get_ascend_config
 
+            try:
+                offload_config = get_ascend_config().sparse_kv_offload_config
+            except RuntimeError:
+                # Config-less contexts (unit tests) keep the legacy lifecycle.
+                offload_config = None
             cached = self._d2h_delayed_free_cached = bool(
-                get_ascend_config().sparse_kv_offload_config.delayed_d2h
+                getattr(offload_config, "delayed_d2h", False)
             )
         return cached
 
