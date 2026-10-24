@@ -46,6 +46,16 @@ from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend
 from vllm_ascend.utils import vllm_version_is
+
+# The upstream V2 speculator prepares prefill inputs through a Triton JIT
+# kernel, which does not exist on NPUs. Reuse the CPU implementation that
+# mainline ships for 310P (identical semantics, pure PyTorch).
+from vllm_ascend._310p.worker.v2.spec_utils import (  # noqa: E402
+    prepare_decode_inputs_cpu,
+    prepare_prefill_inputs_cpu,
+    update_draft_inputs_cpu,
+)
+
 from vllm_ascend.worker.dcp_utils import DCPManager
 from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
 from vllm_ascend.worker.v2.attn_utils import (
@@ -77,6 +87,16 @@ if TYPE_CHECKING:
     from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 logger = logging.getLogger(__name__)
+
+
+if vllm_version_is("0.31.0"):
+    from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as _ar_speculator
+else:
+    from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import speculator as _ar_speculator
+
+_ar_speculator.prepare_prefill_inputs = prepare_prefill_inputs_cpu
+_ar_speculator.prepare_decode_inputs = prepare_decode_inputs_cpu
+_ar_speculator.update_draft_inputs = update_draft_inputs_cpu
 
 
 class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveSpeculator):
