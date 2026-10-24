@@ -695,6 +695,8 @@ class NPUModelRunner(GPUModelRunner):
         self._offload_token_to_req = None
         self._offload_pool_slots = None
         self._offload_pool_active = None
+        self._offload_pool_generations = None
+        self._offload_stable_prefixes = None
         self._offload_request_states = (
             CopySfaRequestStates()
             if self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_fused_copy_sfa
@@ -707,6 +709,8 @@ class NPUModelRunner(GPUModelRunner):
             if self.sparse_kv_offload_config.use_fused_copy_sfa:
                 self._offload_pool_slots = self._make_buffer(self.max_num_reqs + 2, dtype=torch.int32)
                 self._offload_pool_active = self._make_buffer(self.max_num_reqs + 2, dtype=torch.bool)
+                self._offload_pool_generations = self._make_buffer(self.max_num_reqs + 2, dtype=torch.int64)
+                self._offload_stable_prefixes = self._make_buffer(self.max_num_reqs + 2, dtype=torch.int32)
 
     @property
     def use_dcp(self) -> bool:
@@ -1836,6 +1840,57 @@ class NPUModelRunner(GPUModelRunner):
 
         return attn_state
 
+    # ===== Delayed D2H hooks =====
+
+    def _d2h_enabled(self) -> bool:
+        return (
+            getattr(self, "sparse_kv_offload_enabled", False)
+            and getattr(self, "sparse_kv_offload_config", None) is not None
+            and getattr(self.sparse_kv_offload_config, "delayed_d2h", False)
+            and getattr(self, "sparse_kv_offload_manager", None) is not None
+            and self._offload_pool_slots is not None
+            and self._offload_pool_generations is not None
+        )
+
+    def _d2h_retire(self) -> int:
+        if not self._d2h_enabled():
+            return 0
+        return self.sparse_kv_offload_manager.retire_d2h()
+
+    def _d2h_reject_preemptions(self, preempted_req_ids) -> None:
+        """Fail before state reuse until D2H preemption has a restore protocol."""
+        if self._d2h_enabled() and preempted_req_ids:
+            raise RuntimeError(
+                "delayed D2H does not support scheduler preemption yet; "
+                "preemption resets num_computed_tokens and releases KV blocks "
+                f"without rebuilding resident tails (requests: {preempted_req_ids})"
+            )
+
+    def _d2h_plan_and_launch(self, num_reqs: int) -> int:
+        if not self._d2h_enabled():
+            return 0
+        manager = self.sparse_kv_offload_manager
+        count = manager.plan_d2h_requests(
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            self._offload_pool_slots.np[:num_reqs],
+            self._offload_pool_generations.np[:num_reqs],
+            self.input_batch.block_table[manager.d2h_host_kv_cache_group_id].get_numpy_array()[:num_reqs],
+            np.ones(num_reqs, dtype=np.bool_),
+        )
+        if count:
+            # All TP ranks freeze and launch the same host plan. Only TP0
+            # issues the physical copy; other ranks mark the batch submitted
+            # so they participate in the matching retire collective.
+            manager.launch_d2h()
+        return count
+
+    def _d2h_record_source_ready(self) -> bool:
+        if not self._d2h_enabled():
+            return False
+        return self.sparse_kv_offload_manager.record_d2h_source_ready()
+
+
+
     def _sanitize_placeholder_input_ids_for_forward(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2408,6 +2463,9 @@ class NPUModelRunner(GPUModelRunner):
                             req_state.prev_num_draft_len = 0
 
                 # Update persistent batch states.
+                self._d2h_retire()
+                self._d2h_reject_preemptions(getattr(scheduler_output, "preempted_req_ids", None))
+
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
@@ -2525,6 +2583,7 @@ class NPUModelRunner(GPUModelRunner):
                     if deferred_state_corrections_fn:
                         deferred_state_corrections_fn()
                         deferred_state_corrections_fn = None
+                    self._d2h_plan_and_launch(num_reqs)
                     mamba_bufs = self._get_mamba_bufs()
                     preprocess_bufs = mamba_bufs.preprocess
                     mamba_utils.preprocess_mamba(
@@ -2705,6 +2764,11 @@ class NPUModelRunner(GPUModelRunner):
             # Verify every scheduled layer executed its deferred copy.
             if self.cache_config.mamba_cache_mode == "align" and mamba_copy_connector is not None:
                 mamba_copy_connector.finish_mamba_state_copy()
+        if not defer_kv_connector_finalize:
+            # Target forward is the final KV writer when speculative proposal
+            # does not run on this rank; MTP records the frontier in
+            # sample_tokens() after all draft steps instead.
+            self._d2h_record_source_ready()
         if active_device_metadata_executor is not None and active_device_metadata_executor.submission_in_flight:
             active_device_metadata_executor.release()
         self.kvpp.complete_forward()
@@ -3007,6 +3071,9 @@ class NPUModelRunner(GPUModelRunner):
             # draft model runs so KV pool save/put can complete.
             if self.speculative_config is not None:
                 self.finalize_kv_connector()
+                # MTP proposal is the last possible KV writer in this outer
+                # iteration. Keep this event outside captured target/MTP graphs.
+                self._d2h_record_source_ready()
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
@@ -3806,6 +3873,7 @@ class NPUModelRunner(GPUModelRunner):
                 hot_tokens=self.sparse_kv_offload_config.topk_buffer_size,
                 dummy=offload_dummy,
                 lim_cache_histories=lim_cache_histories,
+                generations=self._offload_pool_generations.np,
             )
             self._copy_sfa_need_eager_tail_restore = restore_tails
             if dense_fills:
@@ -3815,6 +3883,31 @@ class NPUModelRunner(GPUModelRunner):
                     block_size=self.cache_config.block_size,
                     block_table=self.input_batch.block_table[0].get_numpy_array(),
                 )
+            if self._d2h_enabled():
+                # Newly bound rows adopt the manager's D2H ledger at their
+                # aligned computed frontier; every row then publishes its
+                # stable prefix for the metadata builder.
+                manager = self.sparse_kv_offload_manager
+                if offload_dummy:
+                    self._offload_stable_prefixes.np[:num_reqs_padded] = 0
+                else:
+                    active_slots = self._offload_pool_slots.np[:num_reqs].astype(np.int64, copy=False)
+                    active_generations = self._offload_pool_generations.np[:num_reqs]
+                    owner_generations = manager.d2h_owner_generations_cpu[active_slots]
+                    newly_bound = owner_generations != active_generations
+                    if np.any(newly_bound):
+                        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                        initial_prefixes = (
+                            computed[newly_bound] // self.cache_config.block_size * self.cache_config.block_size
+                        )
+                        manager.initialize_d2h_slots(
+                            active_slots[newly_bound],
+                            active_generations[newly_bound],
+                            initial_prefixes,
+                        )
+                    self._offload_stable_prefixes.np[:num_reqs] = manager.d2h_stable_prefixes_cpu[active_slots]
+                self._offload_pool_generations.copy_to_gpu(num_reqs_padded)
+                self._offload_stable_prefixes.copy_to_gpu(num_reqs_padded)
         attn_metadata: PerLayerAttnMetadata = {}
         device_metadata_tasks: list[DeviceMetadataTask] | None = (
             [] if self.device_metadata_executor is not None else None
@@ -3997,6 +4090,11 @@ class NPUModelRunner(GPUModelRunner):
                                    if self._offload_pool_slots is not None else None),
             req_topk_buffer_active=(self._offload_pool_active.cpu[:num_reqs_padded]
                                          if self._offload_pool_active is not None else None),
+            req_topk_buffer_stable_prefixes=(
+                self._offload_stable_prefixes.gpu[:num_reqs_padded]
+                if self._offload_stable_prefixes is not None
+                else None
+            ),
             offload_dummy=offload_dummy,
             copy_sfa_restore_tails=self._copy_sfa_need_eager_tail_restore,
             mm_req_doc_ranges=req_doc_ranges,

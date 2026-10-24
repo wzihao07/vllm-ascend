@@ -867,6 +867,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         if self.runner._offload_pool_slots is not None
                         else None
                     ),
+                    req_topk_buffer_stable_prefixes=(
+                        self.runner._offload_stable_prefixes.gpu[:num_reqs]
+                        if getattr(self.runner, '_offload_stable_prefixes', None) is not None
+                        else None
+                    ),
                     req_topk_buffer_active=(
                         self.runner._offload_pool_active.cpu[:num_reqs]
                         if self.runner._offload_pool_active is not None
@@ -2373,6 +2378,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             is_prefilling=common_attn_metadata.is_prefilling,
             max_seq_len=0,
             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
+            req_topk_buffer_stable_prefixes=common_attn_metadata.req_topk_buffer_stable_prefixes,
             req_topk_buffer_active=common_attn_metadata.req_topk_buffer_active,
             offload_dummy=common_attn_metadata.offload_dummy,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
@@ -2470,6 +2476,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             is_prefilling=common_attn_metadata.is_prefilling,
             max_seq_len=0,
             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
+            req_topk_buffer_stable_prefixes=common_attn_metadata.req_topk_buffer_stable_prefixes,
             req_topk_buffer_active=common_attn_metadata.req_topk_buffer_active,
             offload_dummy=common_attn_metadata.offload_dummy,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
