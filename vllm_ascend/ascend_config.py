@@ -1805,6 +1805,8 @@ class SparseKVOffloadConfig:
     store_port_base: int = 8500
     topk: int = dataclasses.field(default=0, init=False)
     use_fused_overlap: bool = False
+    # Delayed batch D2H (async full-block offload across steps)
+    delayed_d2h: bool = False
 
     @property
     def use_fused_copy_sfa(self) -> bool:
