@@ -547,32 +547,6 @@ class NPUModelRunner(GPUModelRunner):
             self.kv_block_zeroer = zeroer.delegate
         super().shutdown()
 
-    # V1-layout aliases: the proposer and shared offload code read the pool
-    # buffers through the runner; in V2 they live on the model state.
-    @property
-    def _offload_pool_slots(self):
-        return getattr(self.model_state, "_offload_pool_slots", None)
-
-    @property
-    def _offload_pool_active(self):
-        return getattr(self.model_state, "_offload_pool_active", None)
-
-    @property
-    def _offload_pool_generations(self):
-        return getattr(self.model_state, "_offload_pool_generations", None)
-
-    @property
-    def _offload_stable_prefixes(self):
-        return getattr(self.model_state, "_offload_stable_prefixes", None)
-
-    @property
-    def _offload_req_ids_tensor(self):
-        return getattr(self.model_state, "_offload_req_ids", None)
-
-    @property
-    def _offload_token_to_req(self):
-        return getattr(self.model_state, "_offload_token_to_req", None)
-
     # ===== Delayed D2H hooks =====
 
     def _d2h_enabled(self) -> bool:
@@ -582,20 +556,23 @@ class NPUModelRunner(GPUModelRunner):
             and getattr(self.model_state, "_offload_pool_generations", None) is not None
         )
 
-    def _d2h_retire(self) -> int:
+    def _d2h_retire(self, preempted_req_ids=None) -> int:
+        """Retire the previous delayed batch and fail loudly on preemption.
+
+        Preemption resets num_computed_tokens and releases KV blocks without
+        rebuilding resident tails, so it must be rejected until D2H grows a
+        restore protocol.
+        """
         if not self._d2h_enabled():
             return 0
-        return self.sparse_kv_offload_manager.retire_d2h()
-
-    def _d2h_reject_preemptions(self, preempted_req_ids) -> None:
-        """Fail before state reuse until D2H preemption has a restore protocol."""
-        if self._d2h_enabled() and preempted_req_ids:
+        if preempted_req_ids:
             preempted = ", ".join(sorted(preempted_req_ids))
             raise RuntimeError(
                 "delayed D2H does not support scheduler preemption yet; "
                 "preemption resets num_computed_tokens and releases KV blocks "
                 f"without rebuilding resident tails (requests: {preempted})"
             )
+        return self.sparse_kv_offload_manager.retire_d2h()
 
     def _d2h_record_source_ready(self) -> bool:
         if not self._d2h_enabled():
@@ -675,8 +652,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # The only normal-path wait for the previous delayed D2H batch.
         # Retire before states are updated and request slots can be reused.
-        self._d2h_retire()
-        self._d2h_reject_preemptions(getattr(scheduler_output, "preempted_req_ids", None))
+        self._d2h_retire(getattr(scheduler_output, "preempted_req_ids", None))
 
         # Preemption stores must complete before the parent updates states and
         # reuses or zeroes the preempted requests' physical KV cache blocks.
