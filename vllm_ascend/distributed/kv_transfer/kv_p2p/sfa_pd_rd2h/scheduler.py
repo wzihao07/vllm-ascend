@@ -520,19 +520,7 @@ class SFAPDRD2HScheduler:
 
     def _d2h_delayed_free(self) -> bool:
         """Whether resident-row release must wait for delayed D2H retirement."""
-        cached = getattr(self, "_d2h_delayed_free_cached", None)
-        if cached is None:
-            from vllm_ascend.ascend_config import get_ascend_config
-
-            try:
-                offload_config = get_ascend_config().sparse_kv_offload_config
-            except RuntimeError:
-                # Config-less contexts (unit tests) keep the legacy lifecycle.
-                offload_config = None
-            cached = self._d2h_delayed_free_cached = bool(
-                getattr(offload_config, "delayed_d2h", False)
-            )
-        return cached
+        return True
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         return self.request_finished_all_groups(request, (block_ids,))

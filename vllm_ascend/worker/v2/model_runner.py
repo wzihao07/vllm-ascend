@@ -551,8 +551,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def _d2h_enabled(self) -> bool:
         return (
-            self.ascend_config.sparse_kv_offload_config.delayed_d2h
-            and self.sparse_kv_offload_manager is not None
+            self.sparse_kv_offload_manager is not None
             and getattr(self.model_state, "_offload_pool_generations", None) is not None
         )
 

@@ -425,7 +425,7 @@ class SFAPDRD2HConsumerWorker:
         else:
             ready_to_cleanup = set()
         if ready_to_cleanup:
-            if self.offload_manager is not None and getattr(self.offload_manager, "delayed_d2h", False):
+            if self.offload_manager is not None:
                 # Request-owned Copy-SFA rows stay reserved until every delayed
                 # D2H batch referencing them has retired; only then may cleanup
                 # run and the scheduler get its finished_sending acknowledgement.

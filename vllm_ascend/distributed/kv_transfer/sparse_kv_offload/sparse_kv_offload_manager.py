@@ -492,9 +492,6 @@ class SparseKVOffloadManager:
     No more scheduling logic: we reuse the original block_table/slot_mapping.
     """
 
-    # Class-level default keeps __new__-constructed instances (unit tests)
-    # on the legacy per-layer path unless __init__ enables the batch pipeline.
-    delayed_d2h = False
 
     def __init__(
         self,
@@ -505,7 +502,6 @@ class SparseKVOffloadManager:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.sparse_kv_offload_config = sparse_kv_offload_config
-        self.delayed_d2h = getattr(sparse_kv_offload_config, "delayed_d2h", False)
 
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -566,8 +562,7 @@ class SparseKVOffloadManager:
         store_port = OFFLOAD_STORE_PORT_BASE + parallel_config.data_parallel_index
         config.store_url = f"tcp://127.0.0.1:{store_port}"
         assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
-        if getattr(sparse_kv_offload_config, "delayed_d2h", False):
-            self._d2h_init_state()
+        self._d2h_init_state()
         self.tp_group.barrier()
 
     def _warmup_external_lru_planner_threads(self) -> int:
@@ -793,7 +788,7 @@ class SparseKVOffloadManager:
             )
         self.token_size_bytes_k = kv_head_num * head_dim_k * dtype.itemsize
         self.token_size_bytes_v = kv_head_num * head_dim_v * dtype.itemsize
-        if self.delayed_d2h:
+        if getattr(self, "_d2h_state_ready", False):
             source_token_capacities = {
                 tensor.numel() * tensor.element_size() // token_bytes
                 for tensors, token_bytes in (
@@ -802,20 +797,20 @@ class SparseKVOffloadManager:
                 )
                 for tensor in tensors
             }
-            if len(source_token_capacities) != 1:
+        if len(source_token_capacities) != 1:
+            raise RuntimeError(
+                f"delayed D2H resident K/V buffers have inconsistent "
+                f"token capacities: {sorted(source_token_capacities)}"
+            )
+        self.d2h_source_token_capacity = next(iter(source_token_capacities))
+        if self.tp_rank == 0:
+            host_block_capacities = {int(tensor.shape[0]) for tensor in (*self.k_caches_cpu, *self.v_caches_cpu)}
+            if host_block_capacities != {self.d2h_host_num_blocks}:
                 raise RuntimeError(
-                    f"delayed D2H resident K/V buffers have inconsistent "
-                    f"token capacities: {sorted(source_token_capacities)}"
+                    "delayed D2H host K/V block capacity does not match kv_cache_config: "
+                    f"actual={sorted(host_block_capacities)}, "
+                    f"configured={self.d2h_host_num_blocks}"
                 )
-            self.d2h_source_token_capacity = next(iter(source_token_capacities))
-            if self.tp_rank == 0:
-                host_block_capacities = {int(tensor.shape[0]) for tensor in (*self.k_caches_cpu, *self.v_caches_cpu)}
-                if host_block_capacities != {self.d2h_host_num_blocks}:
-                    raise RuntimeError(
-                        "delayed D2H host K/V block capacity does not match kv_cache_config: "
-                        f"actual={sorted(host_block_capacities)}, "
-                        f"configured={self.d2h_host_num_blocks}"
-                    )
         if self.topk_buffer_size % self.block_size != 0:
             raise ValueError(
                 "Sparse KV offload topk_buffer_size must be divisible by "
@@ -901,7 +896,7 @@ class SparseKVOffloadManager:
                 cpu_k_shape,
                 cpu_v_shape,
             )
-        if self.delayed_d2h:
+        if getattr(self, "_d2h_state_ready", False):
             self._allocate_d2h_descriptor_state(device)
             self._allocate_d2h_execution_state()
         if self.use_fused_copy_sfa:
@@ -1549,6 +1544,7 @@ class SparseKVOffloadManager:
         self.d2h_host_kv_cache_group_id = self._infer_host_kv_cache_group_id(self.kv_cache_config)
         self.d2h_host_num_blocks = self.kv_cache_config.num_blocks
         self._allocate_d2h_planner_state()
+        self._d2h_state_ready = True
 
     def _allocate_d2h_planner_state(self) -> None:
         """Allocate the dormant CPU control state for delayed D2H."""

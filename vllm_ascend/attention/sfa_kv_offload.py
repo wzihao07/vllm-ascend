@@ -89,19 +89,18 @@ def _validate_fused_copy_sfa_config(vllm_config: VllmConfig, cfg: SparseKVOffloa
             "the dense short-sequence layout only lines up with the circular "
             f"tail slots when topk_buffer_size is a multiple of {COPY_SFA_TAIL_TOKENS}"
         )
-    if cfg.delayed_d2h:
-        kv_transfer_config = vllm_config.kv_transfer_config
-        has_connector = getattr(kv_transfer_config, "has_connector", None)
-        has_remote_d2h = (
-            has_connector("SfaRemoteD2HConnector")
-            if callable(has_connector)
-            else getattr(kv_transfer_config, "kv_connector", None) == "SfaRemoteD2HConnector"
+    kv_transfer_config = vllm_config.kv_transfer_config
+    has_connector = getattr(kv_transfer_config, "has_connector", None)
+    has_remote_d2h = (
+        has_connector("SfaRemoteD2HConnector")
+        if callable(has_connector)
+        else getattr(kv_transfer_config, "kv_connector", None) == "SfaRemoteD2HConnector"
+    )
+    if not has_remote_d2h:
+        raise ValueError(
+            "delayed_d2h currently requires SfaRemoteD2HConnector to provide "
+            "delayed-free lifecycle protection for resident rows"
         )
-        if not has_remote_d2h:
-            raise ValueError(
-                "delayed_d2h currently requires SfaRemoteD2HConnector to provide "
-                "delayed-free lifecycle protection for resident rows"
-            )
 
 
 @dataclass
@@ -216,7 +215,6 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             supports_dcp_with_varlen,
         )
         self.use_fused_copy_sfa = cfg.use_fused_copy_sfa
-        self.delayed_d2h = cfg.delayed_d2h
         if self.use_fused_copy_sfa:
             self._init_copy_sfa_metadata_buffers(vllm_config, device)
         kv_transfer_config = vllm_config.kv_transfer_config
@@ -366,7 +364,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         # Compute row geometry once; LIM state and attention consume the same
         # values. CPU seq_lens may still be optimistic after MTP rejection.
         seq_lens = torch.where(active, common_attn_metadata.seq_lens[:count], widths)
-        if getattr(self, "delayed_d2h", False):
+        if True:  # delayed D2H is the only implementation
             # The resident working table lags computed tokens by up to two
             # blocks; only retired full blocks may leave the resident tail,
             # so geometry follows the runner-owned stable prefixes.
@@ -557,7 +555,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self.block_size = self.vllm_config.cache_config.block_size
         self.use_fused_overlap = offload_cfg.use_fused_overlap
         self.use_fused_copy_sfa = offload_cfg.use_fused_copy_sfa
-        self.delayed_d2h = offload_cfg.delayed_d2h
         self.lim_indexer_owner = self
         self._copy_sfa_metadata: AscendSFAOffloadMetadata | None = None
         if self.use_fused_copy_sfa:
@@ -964,7 +961,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         if self._is_decode_only(attn_metadata):
             manager = get_sparse_kv_offload_manager()
             layer_name = self._offload_layer_name()
-            if attn_metadata.fused_copy_sfa_enabled and self.delayed_d2h:
+            if attn_metadata.fused_copy_sfa_enabled:
                 # Fused normalize/rotate/write: current-token KV is scattered
                 # directly into the resident tail pages by one operator.
                 kv_cache = self._get_current_layer_resident_cache_tensors()
