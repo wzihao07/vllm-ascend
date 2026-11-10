@@ -1742,6 +1742,12 @@ class SparseKVOffloadManager:
             raise RuntimeError("delayed D2H has no source-ready compute frontier")
         with runtime.stream(self.d2h_stream):
             descriptor_count = self.prepare_d2h_descriptors()
+            logger.info_once(
+                "Delayed D2H pipeline active: first batch prepared with %d descriptors "
+                "(subsequent batches log at DEBUG level)",
+                descriptor_count,
+            )
+            logger.debug("Delayed D2H batch launched: %d descriptors", descriptor_count)
             self.d2h_stream.wait_event(self.d2h_source_ready_events[source_slot])
             # TODO: use an asynchronous SDMA copy API after its descriptor and
             # completion semantics are available; keep the existing MTE path
