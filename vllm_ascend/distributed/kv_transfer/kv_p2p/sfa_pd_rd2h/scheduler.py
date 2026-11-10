@@ -537,7 +537,23 @@ class SFAPDRD2HScheduler:
             return True, None
         allocator = getattr(self, "_copy_sfa_slot_allocator", None)
         binding = getattr(self, "_copy_sfa_bindings", {}).get(request.request_id)
-        if self._d2h_delayed_free() and allocator is not None and binding is not None:
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+            get_sparse_kv_offload_manager,
+        )
+
+        # The delayed-free reservation only applies when the offload manager
+        # (and with it the delayed D2H pipeline) is actually instantiated;
+        # manager-less deployments keep the immediate-free lifecycle.
+        try:
+            offload_manager = get_sparse_kv_offload_manager()
+        except AssertionError:
+            offload_manager = None
+        if (
+            self._d2h_delayed_free()
+            and offload_manager is not None
+            and allocator is not None
+            and binding is not None
+        ):
             # Terminal requests keep both their vLLM blocks and the
             # request-owned Copy-SFA row until every worker has retired any
             # D2H batch that can still reference the row. Entries are
