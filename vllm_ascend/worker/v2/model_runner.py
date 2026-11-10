@@ -338,10 +338,12 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         output = super().sample_tokens(grammar_output)
-        if self.speculative_config is not None:
-            # MTP proposal (inside the upstream sample_tokens) is the last
-            # possible KV writer in this outer iteration.
-            self._d2h_record_source_ready()
+        # With speculation, the MTP proposal inside the upstream
+        # sample_tokens is the last possible KV writer in this outer
+        # iteration; without it, the target forward already finished. Either
+        # way this is the first point past the last KV writer, and
+        # dummy-run/profile paths never reach sample_tokens.
+        self._d2h_record_source_ready()
         # Close the per-step msprobe dump cycle on the normal last-PP-rank
         # path (v1 parity: v1 finalizes at the end of sample_tokens).
         self._finalize_dump_data()
@@ -707,11 +709,6 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.model.compute_logits(self.execute_model_state.hidden_states[dummy_indices])
         self.kvpp.complete_forward()
-        if self.speculative_config is None:
-            # Target forward is the final KV writer when speculative proposal
-            # does not run; MTP records the frontier in sample_tokens() after
-            # all draft steps instead.
-            self._d2h_record_source_ready()
 
         if dump_forward:
             if dummy_run:
