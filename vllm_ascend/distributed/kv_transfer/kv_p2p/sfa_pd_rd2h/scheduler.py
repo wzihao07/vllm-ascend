@@ -537,7 +537,25 @@ class SFAPDRD2HScheduler:
             return True, None
         allocator = getattr(self, "_copy_sfa_slot_allocator", None)
         binding = getattr(self, "_copy_sfa_bindings", {}).get(request.request_id)
-        if self._d2h_delayed_free() and allocator is not None and binding is not None:
+        # The delayed-free reservation applies only when the offload config
+        # is enabled (manager-less deployments keep the immediate-free
+        # lifecycle). Read the config instead of querying the manager
+        # singleton: the scheduler runs before/away from the manager's
+        # module-global init window, and a None fallback here would flip
+        # requests to immediate-free mid-flight (observed as late
+        # finished_recving asserting on an already-removed request).
+        try:
+            from vllm_ascend.ascend_config import get_ascend_config
+
+            offload_enabled = get_ascend_config().sparse_kv_offload_config.enabled
+        except RuntimeError:
+            offload_enabled = False
+        if (
+            self._d2h_delayed_free()
+            and offload_enabled
+            and allocator is not None
+            and binding is not None
+        ):
             # Terminal requests keep both their vLLM blocks and the
             # request-owned Copy-SFA row until every worker has retired any
             # D2H batch that can still reference the row. Entries are
