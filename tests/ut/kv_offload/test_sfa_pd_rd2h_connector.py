@@ -1542,7 +1542,14 @@ def test_consumer_scheduler_binds_copy_sfa_tail_at_alloc():
     assert req_meta.tail_block_index == 80
     assert req_meta.kv_tokens == 10367
 
-    scheduler.request_finished_all_groups(request, ([1, 2], [3]))
+    finished, _ = scheduler.request_finished_all_groups(request, ([1, 2], [3]))
+    # Delayed D2H keeps the request-owned row reserved until every worker
+    # retires the batches referencing it (finished_sending handshake).
+    assert finished
+    assert scheduler._copy_sfa_slot_allocator.get("req-tail") == 0
+    scheduler.update_connector_output(
+        SimpleNamespace(finished_sending=["req-tail"], finished_recving=[])
+    )
     assert scheduler._copy_sfa_slot_allocator.get("req-tail") is None
 
 

@@ -513,7 +513,7 @@ class SFAPDRD2HScheduler:
                     dspark_draft_group_ids=(self._dspark_context_groups if req_id in context_requests else ()),
                     dspark_draft_block_ids_by_group=context_requests.get(req_id, (None, None))[1],
                 )
-        for req_id, pool_slot in self._d2h_pending_releases.items():
+        for req_id, pool_slot in getattr(self, "_d2h_pending_releases", {}).items():
             meta.add_d2h_release(req_id, pool_slot)
         self._reqs_need_recv.clear()
         return meta
@@ -542,6 +542,8 @@ class SFAPDRD2HScheduler:
             # request-owned Copy-SFA row until every worker has retired any
             # D2H batch that can still reference the row. Entries are
             # released by update_connector_output() on finished_sending.
+            if not hasattr(self, "_d2h_pending_releases"):
+                self._d2h_pending_releases = {}
             self._d2h_pending_releases[request.request_id] = binding[0]
             return True, None
         self._cleanup_finished_request(request.request_id)

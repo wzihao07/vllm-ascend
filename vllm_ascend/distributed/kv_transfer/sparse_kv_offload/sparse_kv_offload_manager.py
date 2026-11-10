@@ -797,20 +797,20 @@ class SparseKVOffloadManager:
                 )
                 for tensor in tensors
             }
-        if len(source_token_capacities) != 1:
-            raise RuntimeError(
-                f"delayed D2H resident K/V buffers have inconsistent "
-                f"token capacities: {sorted(source_token_capacities)}"
-            )
-        self.d2h_source_token_capacity = next(iter(source_token_capacities))
-        if self.tp_rank == 0:
-            host_block_capacities = {int(tensor.shape[0]) for tensor in (*self.k_caches_cpu, *self.v_caches_cpu)}
-            if host_block_capacities != {self.d2h_host_num_blocks}:
+            if len(source_token_capacities) != 1:
                 raise RuntimeError(
-                    "delayed D2H host K/V block capacity does not match kv_cache_config: "
-                    f"actual={sorted(host_block_capacities)}, "
-                    f"configured={self.d2h_host_num_blocks}"
+                    f"delayed D2H resident K/V buffers have inconsistent "
+                    f"token capacities: {sorted(source_token_capacities)}"
                 )
+            self.d2h_source_token_capacity = next(iter(source_token_capacities))
+            if self.tp_rank == 0:
+                host_block_capacities = {int(tensor.shape[0]) for tensor in (*self.k_caches_cpu, *self.v_caches_cpu)}
+                if host_block_capacities != {self.d2h_host_num_blocks}:
+                    raise RuntimeError(
+                        "delayed D2H host K/V block capacity does not match kv_cache_config: "
+                        f"actual={sorted(host_block_capacities)}, "
+                        f"configured={self.d2h_host_num_blocks}"
+                    )
         if self.topk_buffer_size % self.block_size != 0:
             raise ValueError(
                 "Sparse KV offload topk_buffer_size must be divisible by "

@@ -430,11 +430,13 @@ class SFAPDRD2HConsumerWorker:
                 # D2H batch referencing them has retired; only then may cleanup
                 # run and the scheduler get its finished_sending acknowledgement.
                 d2h_owned = {req_id for req_id in ready_to_cleanup if req_id in self.copy_sfa_slots_by_req}
+                if not hasattr(self, "_d2h_pending_release_req_ids"):
+                    self._d2h_pending_release_req_ids = set()
                 self._d2h_pending_release_req_ids.update(d2h_owned)
                 self._cleanup_request_state(ready_to_cleanup - d2h_owned)
             else:
                 self._cleanup_request_state(ready_to_cleanup)
-        if self._d2h_pending_release_req_ids:
+        if getattr(self, "_d2h_pending_release_req_ids", None):
             if self.offload_manager is None:
                 raise RuntimeError("delayed D2H row release requires the sparse KV offload manager")
             releasable = {
