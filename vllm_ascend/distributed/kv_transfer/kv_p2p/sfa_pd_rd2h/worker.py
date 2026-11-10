@@ -317,7 +317,7 @@ class SFAPDRD2HConsumerWorker:
             getattr(self, "_dspark_draft_blocks_by_req", {}).pop(ext_id, None)
             getattr(self, "copy_sfa_slots_by_req", {}).pop(req_id, None)
             getattr(self, "_copy_sfa_tail_by_req", {}).pop(ext_id, None)
-            self._d2h_pending_release_req_ids.discard(req_id)
+            getattr(self, "_d2h_pending_release_req_ids", set()).discard(req_id)
             self._pending_done.discard(ext_id)
             self._terminal_ext_ids.discard(ext_id)
         # Drop any partial contributor-completion state so a dead contributor or a
@@ -429,11 +429,11 @@ class SFAPDRD2HConsumerWorker:
         else:
             ready_to_cleanup = set()
         if ready_to_cleanup:
-            if self.offload_manager is not None:
+            if getattr(self, "offload_manager", None) is not None:
                 # Request-owned Copy-SFA rows stay reserved until every delayed
                 # D2H batch referencing them has retired; only then may cleanup
                 # run and the scheduler get its finished_sending acknowledgement.
-                d2h_owned = {req_id for req_id in ready_to_cleanup if req_id in self.copy_sfa_slots_by_req}
+                d2h_owned = {req_id for req_id in ready_to_cleanup if req_id in getattr(self, "copy_sfa_slots_by_req", {})}
                 if not hasattr(self, "_d2h_pending_release_req_ids"):
                     self._d2h_pending_release_req_ids = set()
                 self._d2h_pending_release_req_ids.update(d2h_owned)
@@ -441,12 +441,12 @@ class SFAPDRD2HConsumerWorker:
             else:
                 self._cleanup_request_state(ready_to_cleanup)
         if getattr(self, "_d2h_pending_release_req_ids", None):
-            if self.offload_manager is None:
+            if getattr(self, "offload_manager", None) is None:
                 raise RuntimeError("delayed D2H row release requires the sparse KV offload manager")
             releasable = {
                 req_id
                 for req_id in self._d2h_pending_release_req_ids
-                if self.offload_manager.d2h_slot_releasable(self.copy_sfa_slots_by_req[req_id])
+                if self.offload_manager.d2h_slot_releasable(getattr(self, "copy_sfa_slots_by_req", {})[req_id])
             }
             if releasable:
                 slots = [self.copy_sfa_slots_by_req[req_id] for req_id in sorted(releasable)]

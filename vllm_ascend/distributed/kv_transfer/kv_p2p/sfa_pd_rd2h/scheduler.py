@@ -557,6 +557,8 @@ offload_enabled
             # released by update_connector_output() on finished_sending.
             if not hasattr(self, "_d2h_pending_releases"):
                 self._d2h_pending_releases = {}
+            if not hasattr(self, "_d2h_pending_releases"):
+                self._d2h_pending_releases = {}
             self._d2h_pending_releases[request.request_id] = binding[0]
             return True, None
         self._cleanup_finished_request(request.request_id)
@@ -564,18 +566,26 @@ offload_enabled
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         for req_id in connector_output.finished_sending or ():
-            if req_id in self._d2h_pending_releases:
+            if req_id in getattr(self, "_d2h_pending_releases", {}):
                 # The worker retired every D2H batch referencing the row and
                 # released it; now drop the binding and free the allocator.
-                self._d2h_pending_releases.pop(req_id, None)
+                self._d2h_pending_releases.pop(req_id, None)  # attr guaranteed by membership check above
                 self._cleanup_finished_request(req_id)
         completed = set(connector_output.finished_recving or ())
+        # A dspark request that finished after its transport join took the
+        # delayed-D2H reservation branch instead of the deferred one; its
+        # rows retire with the transport, so drain them here too.
+        for request_id in completed:
+            pending = getattr(self, "_d2h_pending_releases", None)
+            if pending and request_id in pending:
+                pending.pop(request_id, None)
+                self._cleanup_finished_request(request_id)
         self._dspark_pending_recv.difference_update(completed)
         for request_id in completed & self._deferred_finished_req_ids:
             # The dspark drain path releases the slot allocator without the
             # finished_sending handshake; drop the delayed D2H release entry
             # too, or it is resent forever and re-reserves the reused slot.
-            self._d2h_pending_releases.pop(request_id, None)
+            getattr(self, "_d2h_pending_releases", {}).pop(request_id, None)
             self._cleanup_finished_request(request_id)
 
     def _cleanup_finished_request(self, request_id: str) -> None:
