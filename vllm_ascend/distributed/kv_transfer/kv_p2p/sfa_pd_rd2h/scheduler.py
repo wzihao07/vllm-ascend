@@ -518,10 +518,6 @@ class SFAPDRD2HScheduler:
         self._reqs_need_recv.clear()
         return meta
 
-    def _d2h_delayed_free(self) -> bool:
-        """Whether resident-row release must wait for delayed D2H retirement."""
-        return True
-
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         return self.request_finished_all_groups(request, (block_ids,))
 
@@ -551,8 +547,7 @@ class SFAPDRD2HScheduler:
         except RuntimeError:
             offload_enabled = False
         if (
-            self._d2h_delayed_free()
-            and offload_enabled
+offload_enabled
             and allocator is not None
             and binding is not None
         ):

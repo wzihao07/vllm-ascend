@@ -644,6 +644,7 @@ class NPUPlatform(Platform):
         # (fused MC2 exclusivity + scheduler extension policies)
         # ascend_config is only used for verification, this object must NOT be modified here
         ascend_config = init_ascend_config(vllm_config)
+        _disable_d2h_pd_decode_prefix_caching(vllm_config, ascend_config)
         _validate_deepseek_v4_tp_config(vllm_config)
         _check_ascend_config(vllm_config, ascend_config)
 
@@ -1170,6 +1171,43 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
         )
     elif vllm_config.parallel_config.enable_eplb:
         raise ValueError("Upstream EPLB is only supported by Model Runner V2 on Ascend.")
+
+
+
+def _disable_d2h_pd_decode_prefix_caching(vllm_config: VllmConfig, ascend_config) -> None:
+    """Force-disable local prefix caching on delayed-D2H decode nodes.
+
+    Ported from the Nano delayed-D2H implementation (ader47): the scheduler
+    can register a Decode block that becomes full in this batch before its
+    KV is computed or copied to host; a locally resumed (prefix-cache hit)
+    request can consume that block in the same batch without another
+    P-to-D transfer. The batch-end D2H wait is too late to protect this
+    read, so local sharing stays disabled until cache readiness is enforced
+    at admission or consumption. Prefill and offload-free paths keep their
+    existing prefix-cache configuration.
+    """
+    sparse_config = ascend_config.sparse_kv_offload_config
+    transfer_config = vllm_config.kv_transfer_config
+    has_connector = getattr(transfer_config, "has_connector", None)
+    has_sfa_remote_d2h = transfer_config is not None and (
+        has_connector("SfaRemoteD2HConnector")
+        if callable(has_connector)
+        else transfer_config.kv_connector == "SfaRemoteD2HConnector"
+    )
+    if (
+        not sparse_config.enabled
+        or not sparse_config.use_fused_copy_sfa
+        or not has_sfa_remote_d2h
+        or transfer_config.kv_role != "kv_consumer"
+        or not vllm_config.cache_config.enable_prefix_caching
+    ):
+        return
+    logger.warning_once(
+        "Sparse-KV-offload decode nodes using SfaRemoteD2HConnector do not "
+        "support local prefix caching; setting enable_prefix_caching=False. "
+        "Prefill and offload-free paths are unchanged."
+    )
+    vllm_config.cache_config.enable_prefix_caching = False
 
 
 def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
