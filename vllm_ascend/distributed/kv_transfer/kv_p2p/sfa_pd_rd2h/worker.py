@@ -265,6 +265,8 @@ class SFAPDRD2HConsumerWorker:
                     self._dspark_pending_recv.add(req_id)
                 pool_slot = getattr(req, "pool_slot", None)
                 if pool_slot is not None:
+                    if not hasattr(self, "copy_sfa_slots_by_req"):
+                        self.copy_sfa_slots_by_req = {}
                     self.copy_sfa_slots_by_req[req_id] = int(pool_slot)
                     dense = bool(getattr(req, "dense", False))
                     tail_tokens = int(getattr(req, "tail_tokens", 0) or 0)
@@ -282,6 +284,8 @@ class SFAPDRD2HConsumerWorker:
         for req_id, pool_slot in getattr(metadata, "d2h_releases", {}).items():
             if req_id in self._d2h_released_req_ids:
                 continue
+            if not hasattr(self, "copy_sfa_slots_by_req"):
+                self.copy_sfa_slots_by_req = {}
             self.copy_sfa_slots_by_req.setdefault(req_id, int(pool_slot))
 
     def save_kv_layer(
