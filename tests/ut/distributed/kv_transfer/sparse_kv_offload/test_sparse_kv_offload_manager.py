@@ -4,7 +4,6 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
-
 from torch import Tensor
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
@@ -616,6 +615,7 @@ class TestHostKVRegistration(unittest.TestCase):
                 manager._init_fused_overlap_planner.assert_not_called()
 
 
+<<<<<<< HEAD
 class TestSparseKVOffloadStorePort(unittest.TestCase):
     def test_default_base_keeps_the_historical_endpoint(self):
         config = SimpleNamespace(store_port_base=8500)
@@ -658,6 +658,8 @@ class TestSparseKVOffloadStorePort(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "valid TCP port"):
             resolve_sparse_kv_offload_store_url(config, 1)
+=======
+>>>>>>> 7eee7033a (fix(kv_offload): unblock CI on lint, typing and CPU-UT)
 class TestDelayedD2HPlanner(unittest.TestCase):
     @staticmethod
     def _manager(max_num_reqs: int = 4) -> SparseKVOffloadManager:
@@ -675,7 +677,7 @@ class TestDelayedD2HPlanner(unittest.TestCase):
         return manager
 
     def _manager_with_execution_state(self, tp_size: int = 1, tp_rank: int = 0):
-        calls = []
+        calls: list[tuple[str, ...]] = []
 
         class FakeEvent:
             def __init__(self, name):
