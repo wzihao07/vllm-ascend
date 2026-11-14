@@ -146,6 +146,16 @@ class TestSparseKVOffloadOwnerReset(unittest.TestCase):
         self.assertIsNone(manager.fused_overlap_plan_membership_map)
 
 
+def _unpinned_zeros(*args, **kwargs):
+    kwargs["pin_memory"] = False
+    return torch.zeros(*args, **kwargs)
+
+
+def _unpinned_empty(*args, **kwargs):
+    kwargs["pin_memory"] = False
+    return torch.empty(*args, **kwargs)
+
+
 class _FakeKVCacheSpec:
     def __init__(
         self,
@@ -615,7 +625,6 @@ class TestHostKVRegistration(unittest.TestCase):
                 manager._init_fused_overlap_planner.assert_not_called()
 
 
-<<<<<<< HEAD
 class TestSparseKVOffloadStorePort(unittest.TestCase):
     def test_default_base_keeps_the_historical_endpoint(self):
         config = SimpleNamespace(store_port_base=8500)
@@ -658,8 +667,8 @@ class TestSparseKVOffloadStorePort(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "valid TCP port"):
             resolve_sparse_kv_offload_store_url(config, 1)
-=======
->>>>>>> 7eee7033a (fix(kv_offload): unblock CI on lint, typing and CPU-UT)
+
+
 class TestDelayedD2HPlanner(unittest.TestCase):
     @staticmethod
     def _manager(max_num_reqs: int = 4) -> SparseKVOffloadManager:
@@ -668,7 +677,14 @@ class TestDelayedD2HPlanner(unittest.TestCase):
         manager.block_size = 128
         manager.topk_buffer_size = 8192
         manager.tp_size = 1
-        manager._allocate_d2h_planner_state()
+        # CPU-only runners cannot pin host memory (torch_npu hooks are not
+        # registered); mirror the runner-owned buffers' UT strategy and force
+        # the staging allocations to plain pageable memory.
+        with (
+            patch.object(torch, "zeros", side_effect=_unpinned_zeros),
+            patch.object(torch, "empty", side_effect=_unpinned_empty),
+        ):
+            manager._allocate_d2h_planner_state()
         manager.d2h_host_kv_cache_group_id = 0
         manager.d2h_host_num_blocks = 4096
         manager.d2h_source_token_capacity = (
