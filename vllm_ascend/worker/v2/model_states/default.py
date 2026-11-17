@@ -630,27 +630,7 @@ class AscendModelState(DefaultModelState):
                 if getattr(metadata, "copy_sfa_copy_src_offsets", None) is not None:
                     manager.restore_copy_sfa_tails(metadata)
                     break
-        # Delayed D2H: freeze this step's full-block plan and launch the
-        # previous one right after metadata is built, so the async copy
-        # overlaps the upcoming forward. The manager getter raises on
-        # non-sparse nodes (e.g. the PD producer), so only query it when the
-        # fused copy-sfa request states were prepared for this batch.
-        if request_states is not None and not getattr(input_batch, "is_dummy", False) and pool_generations is not None:
-            manager = get_sparse_kv_offload_manager()
-            assert pool_slots is not None
-            num_real_reqs = input_batch.num_reqs
-            count = manager.plan_d2h_requests(
-                input_batch.num_computed_tokens_np[:num_real_reqs],
-                pool_slots.np[:num_real_reqs],
-                pool_generations.np[:num_real_reqs],
-                # V2 keeps block ids device-only (no CPU mirror); one
-                # small blocking D2H fetch is the planner's host input.
-                block_tables[manager.d2h_host_kv_cache_group_id][:num_real_reqs].cpu().numpy(),
-                np.ones(num_real_reqs, dtype=np.bool_),
-            )
-            if count:
-                # All TP ranks freeze and launch the same host plan. Only
-                # TP0 issues the physical copy; other ranks mark the batch
-                # submitted to join the matching retire collective.
-                manager.launch_d2h()
+        # Delayed D2H planning and launching moved to the runner's step
+        # boundary (model_runner._sparse_kv_offload_d2h_plan_launch): the
+        # builder only settles offload state and consumes it here.
         return self.attn_metadata

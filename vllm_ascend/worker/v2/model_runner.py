@@ -695,6 +695,51 @@ class NPUModelRunner(GPUModelRunner):
         assert manager is not None
         return manager.retire_d2h()
 
+    def _sparse_kv_offload_d2h_plan_launch(self) -> None:
+        """Freeze this step's full-block D2H plan and launch the previous one.
+
+        Runs at the runner step boundary (after retire and preemption
+        handling, before the forward) instead of inside the attention
+        metadata builder, so transfer scheduling no longer depends on when
+        the builder is called. It consumes the stable-prefix snapshot the
+        previous prepare_attn settled, and the async copy still overlaps
+        the upcoming forward.
+        """
+        if not self._sparse_kv_offload_d2h_enabled():
+            return
+        model_state = self.model_state
+        pool_slots = getattr(model_state, "_offload_pool_slots", None)
+        pool_generations = getattr(model_state, "_offload_pool_generations", None)
+        block_tables = getattr(model_state, "block_tables", None)
+        # getattr guard: the input batch is owned by the parent runner and is
+        # absent from __new__-built unit fixtures.
+        input_batch = getattr(self, "input_batch", None)
+        if (
+            input_batch is None
+            or pool_slots is None
+            or pool_generations is None
+            or block_tables is None
+            or getattr(input_batch, "is_dummy", False)
+        ):
+            return
+        manager = self.sparse_kv_offload_manager
+        assert manager is not None
+        num_real_reqs = input_batch.num_reqs
+        count = manager.plan_d2h_requests(
+            input_batch.num_computed_tokens_np[:num_real_reqs],
+            pool_slots.np[:num_real_reqs],
+            pool_generations.np[:num_real_reqs],
+            # V2 keeps block ids device-only (no CPU mirror); one small
+            # blocking D2H fetch is the planner's host input.
+            block_tables[manager.d2h_host_kv_cache_group_id][:num_real_reqs].cpu().numpy(),
+            np.ones(num_real_reqs, dtype=np.bool_),
+        )
+        if count:
+            # All TP ranks freeze and launch the same host plan. Only TP0
+            # issues the physical copy; other ranks mark the batch submitted
+            # to join the matching retire collective.
+            manager.launch_d2h()
+
     def _sparse_kv_offload_d2h_record_source_ready(self) -> bool:
         if not self._sparse_kv_offload_d2h_enabled():
             return False
@@ -779,6 +824,12 @@ class NPUModelRunner(GPUModelRunner):
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+
+        # Delayed D2H planning/launch belongs to the runner step boundary, not
+        # the attention metadata builder. Runs before the forward so the async
+        # copy still overlaps it; dummy/profile steps never plan.
+        if not dummy_run and not is_profile:
+            self._sparse_kv_offload_d2h_plan_launch()
 
         dump_forward = dummy_run or scheduler_output.total_num_scheduled_tokens > 0
         # Eager PrecisionDebugger is started only for real scheduler steps.
