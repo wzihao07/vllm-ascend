@@ -553,8 +553,6 @@ class SFAPDRD2HScheduler:
             # released by update_connector_output() on finished_sending.
             if not hasattr(self, "_d2h_pending_releases"):
                 self._d2h_pending_releases = {}
-            if not hasattr(self, "_d2h_pending_releases"):
-                self._d2h_pending_releases = {}
             self._d2h_pending_releases[request.request_id] = binding[0]
             return True, None
         self._cleanup_finished_request(request.request_id)
