@@ -549,6 +549,11 @@ class SparseKVOffloadManager:
         decode_width = 1
         if vllm_config.speculative_config is not None:
             decode_width += vllm_config.speculative_config.num_speculative_tokens
+        # CPU-side num_computed_tokens is an optimistic upper bound (draft
+        # tokens count before MTP rejection). Full-block eligibility waits
+        # one decode width beyond the block edge so the optimistic head
+        # never decides the copy; the settled tail is always steady tokens.
+        self.d2h_ready_margin = decode_width - 1
         self.max_num_topk_rows = min(
             self.max_num_tokens,
             self.max_num_reqs * decode_width,
@@ -2030,10 +2035,12 @@ class SparseKVOffloadManager:
         lag = active_computed - stable_prefixes
         if np.any(lag < 0):
             raise RuntimeError("delayed D2H stable prefix is ahead of num_computed_tokens")
-        if np.any(lag >= 2 * self.block_size):
+        # The optimistic head inflates lag by at most d2h_ready_margin, so
+        # the two-unretired-blocks guard uses the widened steady bound too.
+        if np.any(lag >= 2 * self.block_size + self.d2h_ready_margin):
             raise RuntimeError("delayed D2H planner observed two unretired full blocks")
 
-        ready_in_active = lag >= self.block_size
+        ready_in_active = lag >= self.block_size + self.d2h_ready_margin
         if not np.any(ready_in_active):
             return 0
         ready_slots = active_slots[ready_in_active]
