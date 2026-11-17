@@ -676,10 +676,13 @@ class TestSparseKVOffloadStorePort(unittest.TestCase):
 
 class TestDelayedD2HPlanner(unittest.TestCase):
     @staticmethod
-    def _manager(max_num_reqs: int = 4) -> SparseKVOffloadManager:
+    def _manager(max_num_reqs: int = 4, ready_margin: int = 0) -> SparseKVOffloadManager:
         manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
         manager.max_num_reqs = max_num_reqs
         manager.block_size = 128
+        # 0 emulates the no-speculation deployment; tests that exercise the
+        # optimistic-head guard pass an explicit MTP margin instead.
+        manager.d2h_ready_margin = ready_margin
         manager.topk_buffer_size = 8192
         manager.tp_size = 1
         # CPU-only runners cannot pin host memory (torch_npu hooks are not
@@ -894,6 +897,33 @@ class TestDelayedD2HPlanner(unittest.TestCase):
                     np.array([True]),
                 )
                 self.assertEqual(count, expected_count)
+
+    def test_optimistic_head_within_margin_does_not_freeze_plan(self):
+        """An optimistic CPU count crossing the block edge must not copy.
+
+        With MTP the CPU mirror counts draft tokens before rejection, so the
+        planner requires lag >= block_size + margin: the block only becomes
+        eligible once the margin of steady tokens is also committed.
+        """
+        manager = self._manager(ready_margin=3)
+        manager.initialize_d2h_slots(
+            np.array([1]),
+            np.array([12]),
+            np.array([0]),
+        )
+        # Optimistic 130 (127 committed + 3 drafts) still below the widened
+        # 131 bound; a steady 131 freezes the plan.
+        for optimistic_length, expected_count in ((130, 0), (131, 1)):
+            with self.subTest(optimistic_length=optimistic_length):
+                count = manager.plan_d2h_requests(
+                    np.array([optimistic_length]),
+                    np.array([1]),
+                    np.array([12]),
+                    np.array([[40]], dtype=np.int32),
+                    np.array([True]),
+                )
+                self.assertEqual(count, expected_count)
+        self.assertTrue(manager.d2h_inflight_batch_active)
 
     def test_host_destination_must_be_inside_allocated_block_pool(self):
         valid_manager = self._manager()
