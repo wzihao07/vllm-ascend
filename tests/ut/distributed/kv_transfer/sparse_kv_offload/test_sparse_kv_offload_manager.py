@@ -1327,6 +1327,106 @@ class TestDelayedD2HPlanner(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(manager.d2h_inflight_destination_slots_cpu[0], 9)
 
+    def test_idle_step_replan_on_unchanged_snapshot_skips_retired_block(self):
+        # The step-boundary hook plans even on zero-scheduled-token steps,
+        # where upstream skips prepare_attn and the settled snapshot does
+        # not change. Re-planning from the same unchanged snapshot must not
+        # re-freeze the block the retire just consumed.
+        manager, _calls = self._manager_with_execution_state()
+        manager.initialize_d2h_slots(
+            np.array([0]),
+            np.array([3]),
+            np.array([0]),
+        )
+        block_table = np.array([[7, 9]], dtype=np.int32)
+        manager.plan_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([3]),
+            block_table,
+            np.array([True]),
+        )
+        manager.record_d2h_source_ready()
+        with patch.object(
+            manager_module,
+            "offload",
+            SimpleNamespace(sparse_copy=MagicMock(return_value=0)),
+            create=True,
+        ):
+            manager.launch_d2h()
+
+        # Idle step: retire the launched batch, then plan again on the
+        # exact same unchanged snapshot inputs.
+        self.assertEqual(manager.retire_d2h_local(), 1)
+        self.assertEqual(manager.d2h_stable_prefixes_cpu[0], 128)
+        count = manager.plan_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([3]),
+            block_table,
+            np.array([True]),
+        )
+        self.assertEqual(count, 0)
+        self.assertFalse(manager.d2h_inflight_batch_active)
+
+        # The next real frontier plans the next block exactly once.
+        count = manager.plan_d2h_requests(
+            np.array([256]),
+            np.array([0]),
+            np.array([3]),
+            block_table,
+            np.array([True]),
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(manager.d2h_inflight_destination_slots_cpu[0], 9)
+
+    def test_preempted_row_readopts_ledger_at_recomputed_frontier(self):
+        # Preemption resets num_computed_tokens below the row's stable
+        # prefix, which the planner guard rejects. The safe fallback
+        # releases the row and the prepare-side adoption re-initializes it
+        # at the recomputed frontier, after which the planner accepts the
+        # request again.
+        manager = self._manager()
+        manager.initialize_d2h_slots(
+            np.array([0]),
+            np.array([10]),
+            np.array([256]),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "stable prefix is ahead"):
+            manager.plan_d2h_requests(
+                np.array([128]),
+                np.array([0]),
+                np.array([10]),
+                np.array([[7, 9]], dtype=np.int32),
+                np.array([True]),
+            )
+
+        manager.release_d2h_slots([0])
+        manager.initialize_d2h_slots(
+            np.array([0]),
+            np.array([10]),
+            np.array([128]),
+        )
+        count = manager.plan_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([10]),
+            np.array([[7, 9]], dtype=np.int32),
+            np.array([True]),
+        )
+        self.assertEqual(count, 0)
+
+        count = manager.plan_d2h_requests(
+            np.array([256]),
+            np.array([0]),
+            np.array([10]),
+            np.array([[7, 9]], dtype=np.int32),
+            np.array([True]),
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(manager.d2h_inflight_destination_slots_cpu[0], 9)
+
     def test_local_retire_rejects_unlaunched_batch_without_waiting(self):
         manager, calls = self._manager_with_execution_state()
         manager.initialize_d2h_slots(

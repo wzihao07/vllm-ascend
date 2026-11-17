@@ -521,6 +521,16 @@ class NPUModelRunner(GPUModelRunner):
             is_last_pp_rank=self.is_last_pp_rank,
             max_requests=self.max_num_reqs,
         )
+        if self._sparse_kv_offload_d2h_enabled():
+            # The delayed D2H planner reads the Host KV-cache group's block
+            # table every step; mirror that group on the CPU (the tables were
+            # populated by the kv-cache initialization above) so the plan can
+            # gather batch rows without a synchronous device readback.
+            manager = self.sparse_kv_offload_manager
+            assert manager is not None
+            enable_host_block_mirror = getattr(self.block_tables, "enable_host_block_mirror", None)
+            if enable_host_block_mirror is not None:
+                enable_host_block_mirror(manager.d2h_host_kv_cache_group_id)
         if sparse_cfg.enabled and self.speculator is not None:
             # Resident MLA DSpark has no host-pool LRU or LIM tail state.
             self.model_state._offload_draft_attn_groups = (
@@ -669,41 +679,75 @@ class NPUModelRunner(GPUModelRunner):
 
     def _sparse_kv_offload_d2h_enabled(self) -> bool:
         # getattr guards: legacy unit fixtures build the runner via __new__
-        # without __init__'s attribute defaults.
+        # without __init__'s attribute defaults (model_state included).
+        model_state = getattr(self, "model_state", None)
         return (
             getattr(self, "sparse_kv_offload_manager", None) is not None
-            and getattr(self.model_state, "_offload_pool_generations", None) is not None
+            and model_state is not None
+            and getattr(model_state, "_offload_pool_generations", None) is not None
         )
 
     def _sparse_kv_offload_d2h_retire(self, preempted_req_ids=None) -> int:
-        """Retire the previous delayed batch and fail loudly on preemption.
+        """Retire the previous delayed batch, then re-baseline preempted rows.
 
-        Preemption resets num_computed_tokens and releases KV blocks without
-        rebuilding resident tails, so it must be rejected until D2H grows a
-        restore protocol.
+        The retire drains the in-flight copy before the parent's state update
+        can reuse its source buffers. Preemption resets num_computed_tokens
+        and releases KV blocks without rebuilding resident tails, so the D2H
+        ledger rows of preempted requests are invalidated as the safe
+        fallback: the next prepare_attn re-adopts each row at its recomputed
+        frontier (the same newly-bound adoption new requests take), and the
+        recomputed tail rebuilds through the normal Copy-SFA write path.
         """
         if not self._sparse_kv_offload_d2h_enabled():
             return 0
-        if preempted_req_ids:
-            preempted = ", ".join(sorted(preempted_req_ids))
-            raise RuntimeError(
-                "delayed D2H does not support scheduler preemption yet; "
-                "preemption resets num_computed_tokens and releases KV blocks "
-                f"without rebuilding resident tails (requests: {preempted})"
-            )
         manager = self.sparse_kv_offload_manager
         assert manager is not None
-        return manager.retire_d2h()
+        retired = manager.retire_d2h()
+        if preempted_req_ids:
+            self._sparse_kv_offload_d2h_reset_preempted(preempted_req_ids)
+        return retired
+
+    def _sparse_kv_offload_d2h_reset_preempted(self, preempted_req_ids) -> int:
+        """Invalidate the D2H ledger rows of preempted requests.
+
+        Runs before the batch state update, so preempted requests still
+        occupy their last-step rows: map request ids to Copy-SFA pool slots
+        through the settled snapshot and release those slots, restarting
+        their delayed-D2H bookkeeping once the requests resume.
+        """
+        model_state = self.model_state
+        pool_slots = getattr(model_state, "_offload_pool_slots", None)
+        # getattr guard: the input batch is owned by the parent runner and is
+        # absent from __new__-built unit fixtures.
+        input_batch = getattr(self, "input_batch", None)
+        manager = self.sparse_kv_offload_manager
+        if pool_slots is None or input_batch is None or manager is None:
+            return 0
+        if getattr(input_batch, "is_dummy", False):
+            return 0
+        num_real_reqs = input_batch.num_reqs
+        slot_by_req = {input_batch.req_ids[row]: int(pool_slots.np[row]) for row in range(num_real_reqs)}
+        slots = sorted(
+            {slot for req_id in preempted_req_ids if (slot := slot_by_req.get(req_id)) is not None and slot >= 0}
+        )
+        if not slots:
+            return 0
+        manager.release_d2h_slots(slots)
+        return len(slots)
 
     def _sparse_kv_offload_d2h_plan_launch(self) -> None:
-        """Freeze this step's full-block D2H plan and launch the previous one.
+        """Freeze one full-block D2H batch from the settled snapshot and launch it.
 
         Runs at the runner step boundary (after retire and preemption
         handling, before the forward) instead of inside the attention
         metadata builder, so transfer scheduling no longer depends on when
-        the builder is called. It consumes the stable-prefix snapshot the
-        previous prepare_attn settled, and the async copy still overlaps
-        the upcoming forward.
+        the builder is called. The plan reads the snapshot settled by the
+        previous prepare_attn (this step's settle runs later, inside the
+        forward's input prep), so each block's copy starts one step later
+        than the old builder-tail placement. Zero-scheduled-token steps
+        skip prepare_attn upstream but still retire/plan/launch here on
+        the unchanged snapshot. The async copy still overlaps the upcoming
+        forward.
         """
         if not self._sparse_kv_offload_d2h_enabled():
             return
@@ -725,13 +769,23 @@ class NPUModelRunner(GPUModelRunner):
         manager = self.sparse_kv_offload_manager
         assert manager is not None
         num_real_reqs = input_batch.num_reqs
+        mirror = getattr(getattr(self, "block_tables", None), "host_block_mirror", None)
+        idx_mapping = getattr(input_batch, "idx_mapping_np", None)
+        if mirror is not None and idx_mapping is not None:
+            # Batch-ordered gather from the CPU mirror of the last step's
+            # appends (idx_mapping maps batch rows to request slots, padding
+            # rows clamp to 0 exactly like the device gather): identical rows
+            # to the gathered device table, without a blocking D2H fetch.
+            host_block_table = mirror[np.maximum(idx_mapping[:num_real_reqs], 0)]
+        else:
+            # Mirror unavailable (enable_host_block_mirror never ran): keep
+            # the one-shot device readback rather than planning blind.
+            host_block_table = block_tables[manager.d2h_host_kv_cache_group_id][:num_real_reqs].cpu().numpy()
         count = manager.plan_d2h_requests(
             input_batch.num_computed_tokens_np[:num_real_reqs],
             pool_slots.np[:num_real_reqs],
             pool_generations.np[:num_real_reqs],
-            # V2 keeps block ids device-only (no CPU mirror); one small
-            # blocking D2H fetch is the planner's host input.
-            block_tables[manager.d2h_host_kv_cache_group_id][:num_real_reqs].cpu().numpy(),
+            host_block_table,
             np.ones(num_real_reqs, dtype=np.bool_),
         )
         if count:

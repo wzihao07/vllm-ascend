@@ -14,6 +14,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.request_identity impo
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     update_sparse_kv_offload_metadata,
 )
+from vllm_ascend.worker.v2.block_table import AscendBlockTables
+from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.model_states.default import AscendModelState, DefaultModelState
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar import sparse_kv_offload
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.sparse_kv_offload import SparseKVOffloadMetadata
@@ -284,3 +286,117 @@ def test_model_state_removal_ends_owner_incarnation_after_upstream_removal(monke
     state._offload_request_states.remove_request.assert_called_once_with("finished")
     assert state._offload_request_identity.get_or_create("finished") > retained_owner
     assert state._offload_request_identity.get_or_create("temporarily-unscheduled") == retained_owner
+
+
+def test_d2h_retire_drains_before_resetting_preempted_rows():
+    calls: list[object] = []
+    manager = MagicMock()
+
+    def _retire() -> int:
+        calls.append("retire")
+        return 2
+
+    def _release(slots):
+        calls.append(("release", list(slots)))
+
+    manager.retire_d2h.side_effect = _retire
+    manager.release_d2h_slots.side_effect = _release
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.sparse_kv_offload_manager = manager
+    runner.model_state = SimpleNamespace(
+        _offload_pool_generations=object(),
+        _offload_pool_slots=SimpleNamespace(np=np.array([3, 5])),
+    )
+    runner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        req_ids=["req-a", "req-b"],
+        num_computed_tokens_np=np.array([100, 200]),
+    )
+
+    # Preemption must not raise: the previous batch drains first, then the
+    # preempted request's ledger row is released for re-adoption.
+    assert runner._sparse_kv_offload_d2h_retire({"req-b"}) == 2
+    assert calls == ["retire", ("release", [5])]
+
+    # Ids absent from the batch, or dummy batches, still retire (one entry
+    # per call) but release nothing further.
+    def release_count():
+        return sum(1 for entry in calls if isinstance(entry, tuple))
+
+    assert runner._sparse_kv_offload_d2h_retire({"req-gone"}) == 2
+    assert release_count() == 1
+    runner.input_batch.is_dummy = True
+    assert runner._sparse_kv_offload_d2h_retire({"req-a"}) == 2
+    assert release_count() == 1
+
+
+def test_host_block_mirror_tracks_appends_and_overwrites():
+    tables = AscendBlockTables.__new__(AscendBlockTables)
+    tables.max_num_reqs = 4
+    tables.num_kv_cache_groups = 1
+    tables.redirect_writes_to_null_block = False
+    tables.block_tables = [SimpleNamespace(gpu=SimpleNamespace(shape=(4, 6)))]
+    tables.num_blocks = SimpleNamespace(np=np.zeros((1, 4), dtype=np.int32))
+
+    mirror = tables.enable_host_block_mirror(0)
+    assert mirror.shape == (4, 6)
+
+    # Full admission (overwrite): ids land from the row start. num_blocks is
+    # advanced by super().append_block_ids before the mirror write.
+    tables.num_blocks.np[0, 1] = 3
+    tables._mirror_block_ids(1, [5, 6, 7], overwrite=True)
+    assert mirror[1, :3].tolist() == [5, 6, 7]
+    assert mirror[1, 3:].tolist() == [0, 0, 0]
+
+    # Decode delta (append): lands after the existing count.
+    tables.num_blocks.np[0, 1] = 4
+    tables._mirror_block_ids(1, [9], overwrite=False)
+    assert mirror[1, :4].tolist() == [5, 6, 7, 9]
+
+    # Slot reuse on readmission replaces the prefix; the stale tail matches
+    # the staged-write semantics of the device table.
+    tables.num_blocks.np[0, 1] = 1
+    tables._mirror_block_ids(1, [8], overwrite=True)
+    assert mirror[1, :4].tolist() == [8, 6, 7, 9]
+
+
+def test_d2h_plan_launch_gathers_rows_from_host_mirror():
+    captured: dict[str, np.ndarray] = {}
+    manager = MagicMock()
+    manager.d2h_host_kv_cache_group_id = 0
+
+    def _capture_plan(computed, slots, generations, table, active):
+        captured["table"] = table
+        return 0
+
+    manager.plan_d2h_requests.side_effect = _capture_plan
+    mirror = np.zeros((4, 6), dtype=np.int32)
+    mirror[2] = (10, 11, 12, 0, 0, 0)
+    mirror[3] = (20, 21, 0, 0, 0, 0)
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.sparse_kv_offload_manager = manager
+    runner.block_tables = SimpleNamespace(host_block_mirror=mirror)
+    runner.model_state = SimpleNamespace(
+        # The plan slices the generations buffer, so it needs a real array.
+        _offload_pool_generations=SimpleNamespace(np=np.array([4, 6])),
+        _offload_pool_slots=SimpleNamespace(np=np.array([1, 0])),
+        # Deliberately no .cpu on the device table: reaching the readback
+        # fallback would raise, proving the plan consumed the mirror.
+        block_tables=(object(),),
+    )
+    runner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        req_ids=["req-a", "req-b"],
+        num_computed_tokens_np=np.array([10, 20]),
+        idx_mapping_np=np.array([2, 3]),
+    )
+
+    runner._sparse_kv_offload_d2h_plan_launch()
+
+    assert captured["table"].tolist() == [[10, 11, 12, 0, 0, 0], [20, 21, 0, 0, 0, 0]]
+    manager.launch_d2h.assert_not_called()
+
+    # Padded rows map to -1 and clamp to slot 0, matching the device gather.
+    runner.input_batch.idx_mapping_np = np.array([3, -1])
+    runner._sparse_kv_offload_d2h_plan_launch()
+    assert captured["table"].tolist() == [[20, 21, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]]

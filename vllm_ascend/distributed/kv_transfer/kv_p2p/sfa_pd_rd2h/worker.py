@@ -461,6 +461,12 @@ class SFAPDRD2HConsumerWorker:
                 d2h_released.update(releasable)
                 done_sending.update(releasable)
 
+        # A request whose transport receive completes in this same step is
+        # terminally acknowledged by finished_recving alone: the connector
+        # scheduler drains its delayed-release entry on finished_recving,
+        # and also reporting it in finished_sending would make the core
+        # scheduler free the already-removed request a second time.
+        done_sending.difference_update(done_recving)
         return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:

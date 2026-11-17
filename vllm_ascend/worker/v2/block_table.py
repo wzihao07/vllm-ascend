@@ -16,6 +16,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import numpy as np
 import torch
 from vllm.triton_utils import triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -113,6 +114,10 @@ class AscendBlockTables(BlockTables):
             dtype=torch.int32,
             device=self.device,
         )
+        # CPU mirror of one group's source block table for host-side planners
+        # (delayed D2H); enabled by enable_host_block_mirror().
+        self._host_block_mirror: np.ndarray | None = None
+        self._host_block_mirror_group: int | None = None
 
     def append_block_ids(
         self,
@@ -127,7 +132,52 @@ class AscendBlockTables(BlockTables):
             [block_id * blocks_per_kv_block + k for block_id in ids for k in range(blocks_per_kv_block)]
             for ids, blocks_per_kv_block in zip(new_block_ids, self.blocks_per_kv_block)
         )
-        return super().append_block_ids(req_index, expanded_block_ids, overwrite)
+        ret = super().append_block_ids(req_index, expanded_block_ids, overwrite)
+        # super() already advanced num_blocks; mirror the same write so the
+        # host-side planner sees the identical row content. getattr guard:
+        # legacy __new__-built fixtures call this override without __init__'s
+        # attribute defaults.
+        mirror_group = getattr(self, "_host_block_mirror_group", None)
+        if mirror_group is not None:
+            self._mirror_block_ids(req_index, expanded_block_ids[mirror_group], overwrite)
+        return ret
+
+    def enable_host_block_mirror(self, group_id: int) -> np.ndarray:
+        """Keep a CPU mirror of one group's source block table.
+
+        The delayed D2H planner maps batch rows to Host KV-cache blocks every
+        step. The mirror is maintained from the same scheduler-side block-id
+        stream the device table consumes, so the planner can gather batch
+        rows on the host instead of a synchronous device readback.
+        """
+        if not 0 <= group_id < self.num_kv_cache_groups:
+            raise ValueError(f"host block mirror group {group_id} is outside the configured groups")
+        self._host_block_mirror_group = group_id
+        # Bind through a local: CI's pinned mypy (1.11) does not narrow the
+        # Optional attribute after assignment, so returning it directly fails.
+        mirror = np.zeros((self.max_num_reqs, self.block_tables[group_id].gpu.shape[1]), dtype=np.int32)
+        self._host_block_mirror = mirror
+        return mirror
+
+    @property
+    def host_block_mirror(self) -> np.ndarray | None:
+        """CPU mirror of the configured group's source block table, if enabled."""
+        return self._host_block_mirror
+
+    def _mirror_block_ids(self, req_index: int, expanded_ids: list[int], overwrite: bool) -> None:
+        # getattr guards: __new__-built fixtures carry neither mirror field.
+        group = getattr(self, "_host_block_mirror_group", None)
+        mirror = getattr(self, "_host_block_mirror", None)
+        if group is None or mirror is None:
+            return
+        ids = list(expanded_ids)
+        # Class attr on the pinned vLLM; read defensively so older bases
+        # without the warmup redirect keep mirroring verbatim.
+        if getattr(self, "redirect_writes_to_null_block", False):
+            ids = [0] * len(ids)
+        end = int(self.num_blocks.np[group, req_index])
+        start = 0 if overwrite else end - len(ids)
+        mirror[req_index, start : start + len(ids)] = ids
 
     def compute_slot_mappings(
         self,
