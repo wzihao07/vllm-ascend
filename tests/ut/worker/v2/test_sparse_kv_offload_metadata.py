@@ -45,9 +45,20 @@ def _state(*, pool=True):
         return SimpleNamespace(_offload_pool_slots=None, _offload_pool_active=None, _offload_request_identity=registry)
     slots = v1_utils.CpuGpuBuffer(4, dtype=torch.int32, device=torch.device("cpu"), pin_memory=False)
     active = v1_utils.CpuGpuBuffer(4, dtype=torch.bool, device=torch.device("cpu"), pin_memory=False)
+    stable = v1_utils.CpuGpuBuffer(4, dtype=torch.int32, device=torch.device("cpu"), pin_memory=False)
     slots.cpu.copy_(torch.tensor([7, 8, 9, 10]))
     active.cpu.copy_(torch.tensor([True, False, True, False]))
-    return SimpleNamespace(_offload_pool_slots=slots, _offload_pool_active=active, _offload_request_identity=registry)
+    # Distinct settled prefixes per request: live-a settled one block (128),
+    # live-b settled two (256); padding rows keep 0 so any leak from them is
+    # visible in the assertions below.
+    stable.cpu.copy_(torch.tensor([128, 256, 0, 0]))
+    stable.copy_to_gpu(4)
+    return SimpleNamespace(
+        _offload_pool_slots=slots,
+        _offload_pool_active=active,
+        _offload_stable_prefixes=stable,
+        _offload_request_identity=registry,
+    )
 
 
 def _descriptor(mode=CUDAGraphMode.FULL, *, num_reqs=4):
@@ -124,6 +135,10 @@ def test_full_graph_metadata_preserves_live_ids_pool_cpu_views_and_step(monkeypa
     assert kwargs["req_topk_buffer_slots"].tolist() == [7, 8, 9, 10]
     assert kwargs["req_topk_buffer_active"].data_ptr() == state._offload_pool_active.cpu.data_ptr()
     assert kwargs["copy_sfa_draft_index"] == 1
+    # Draft steps must consume the same settled stable prefixes as the
+    # target: distinct per-request values, padded rows keep their 0.
+    assert kwargs["req_topk_buffer_stable_prefixes"] is not None
+    assert kwargs["req_topk_buffer_stable_prefixes"].tolist() == [128, 256, 0, 0]
     assert kwargs["offload_dummy"] is False
 
 
