@@ -497,9 +497,9 @@ class NPUModelRunner(GPUModelRunner):
         persistent_draft_names = resident_draft_names | set(getattr(kv_cache_config, "dspark_draft_layer_names", ()))
         apply_layerwise_kv_cache_plan(kv_cache_config, self.vllm_config, excluded_layer_names=persistent_draft_names)
         if sparse_cfg.enabled:
-            self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
-                self.vllm_config, kv_cache_config, sparse_cfg
-            )
+            manager = init_sparse_kv_offload_manager(self.vllm_config, kv_cache_config, sparse_cfg)
+            manager.resident_layer_names = set(resident_draft_names)
+            self.sparse_kv_offload_manager = manager
             self.model_state._offload_live_req_ids = self.req_states.req_id_to_index
             self.model_state._offload_draft_layer_names = (
                 getattr(self.speculator, "draft_attn_layer_names", set[str]()) - resident_draft_names

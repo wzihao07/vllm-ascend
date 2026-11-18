@@ -554,6 +554,10 @@ class SparseKVOffloadManager:
         # one decode width beyond the block edge so the optimistic head
         # never decides the copy; the settled tail is always steady tokens.
         self.d2h_ready_margin = decode_width - 1
+        # Device-resident DSpark draft layers (paged KV, direct transfer).
+        # Populated by the runner after init; every consumer asks the role
+        # API below instead of re-deriving registry membership.
+        self.resident_layer_names: set[str] = set()
         self.max_num_topk_rows = min(
             self.max_num_tokens,
             self.max_num_reqs * decode_width,
@@ -665,6 +669,15 @@ class SparseKVOffloadManager:
                 f"layer_name={layer_name}, registered_layers=[{registered_layers}]"
             )
         return layer_id
+
+    def is_host_offloaded(self, layer_name: str) -> bool:
+        """Whether the layer owns a host CPU-pool row and D2H pipeline state."""
+        return layer_name in self.layer_name_to_offload_id
+
+    def is_resident_draft(self, layer_name: str) -> bool:
+        """Whether the layer is a device-resident DSpark draft layer."""
+        # getattr guard: __new__-built fixtures may predate the attribute.
+        return layer_name in getattr(self, "resident_layer_names", ())
 
     def _restore_bfloat16_tensor(self, ptr: int, shape: list[int]) -> torch.Tensor:
         view = _sparse_kv_ops().sparse_kv_restore_bfloat16_tensor(ptr, shape)

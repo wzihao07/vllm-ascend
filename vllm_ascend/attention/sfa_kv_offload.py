@@ -618,6 +618,20 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             raise RuntimeError("Sparse KV offload requires a bound attention layer name")
         return layer_name
 
+    def _offload_layer_registered(self) -> bool:
+        """Whether the bound layer participates in the host offload registry.
+
+        Resident DSpark draft layers (e.g. the MTP head) are deliberately
+        unregistered — their KV stays in the paged cache for device-to-device
+        transfer — so every copy-SFA row swap must fall back to the standard
+        paged preprocess/write path for them.
+        """
+        # getattr guards on both: __new__-built fixtures may bind neither.
+        layer_name = getattr(self, "layer_name", None) or getattr(self, "_current_layer_name", None)
+        if layer_name is None:
+            return False
+        return get_sparse_kv_offload_manager().is_host_offloaded(layer_name)
+
     @staticmethod
     def _is_decode_only(attn_metadata: M) -> bool:
         return (
@@ -889,7 +903,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         torch.Tensor,
         torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
     ]:
-        if attn_metadata is not None and self._is_decode_only(attn_metadata):
+        if attn_metadata is not None and self._is_decode_only(attn_metadata) and self._offload_layer_registered():
             kv_cache = self._get_current_layer_resident_cache_tensors()
             slot_mapping = attn_metadata.copy_sfa_device_slots
         return super()._sfa_preprocess_prolog_v3(
@@ -917,7 +931,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         torch.Tensor,
         torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
     ]:
-        if attn_metadata is not None and self._is_decode_only(attn_metadata):
+        if attn_metadata is not None and self._is_decode_only(attn_metadata) and self._offload_layer_registered():
             kv_cache = self._get_current_layer_resident_cache_tensors()
             slot_mapping = attn_metadata.copy_sfa_device_slots
         return super()._sfa_preprocess_mlapo(
@@ -944,6 +958,17 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         # Offload completes synchronously, including cache writes and CPU commits.
         attn_metadata = cast(AscendSFAOffloadMetadata, attn_metadata)
         if self._is_decode_only(attn_metadata):
+            if not self._offload_layer_registered():
+                # Resident DSpark draft layers keep the paged write path.
+                return super().exec_kv(
+                    kv_no_split=kv_no_split,
+                    cos=cos,
+                    sin=sin,
+                    kv_cache=kv_cache,
+                    slots=slots,
+                    attn_metadata=attn_metadata,
+                    defer_wait=defer_wait,
+                )
             manager = get_sparse_kv_offload_manager()
             layer_name = self._offload_layer_name()
             if attn_metadata.fused_copy_sfa_enabled:
@@ -978,6 +1003,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         # Prefill / mixed batch (colocate debug only): stage in the NPU paged
         # main cache as usual, then commit the written rows D2H into the
         # shared CPU pool.
+        if not self._offload_layer_registered():
+            # Resident DSpark draft layers stage paged KV only: no D2H commit.
+            return super().exec_kv(kv_no_split, cos, sin, kv_cache, slots, attn_metadata)
         _check_device_kv_cache_exist()
         result = super().exec_kv(kv_no_split, cos, sin, kv_cache, slots, attn_metadata)
         manager = get_sparse_kv_offload_manager()
@@ -1009,6 +1037,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         the last chunk leaves exactly the state the first decode expects.
         """
         if not self.use_fused_copy_sfa or not get_ascend_config().sparse_kv_offload_config.keep_device_kv_cache:
+            return
+        if layer_name not in manager.layer_name_to_offload_id:
+            # Resident DSpark draft layers have no copy-SFA row to fill.
             return
         pool_slots = getattr(attn_metadata, "copy_sfa_prefill_pool_slots", None)
         if pool_slots is None:
@@ -1668,6 +1699,21 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         num_prefills = int(getattr(attn_metadata, "num_prefills", 0) or 0)
         manager = get_sparse_kv_offload_manager()
         layer_name = self._offload_layer_name()
+
+        if not self._offload_layer_registered():
+            # Resident DSpark draft layers keep their own paged device KV and
+            # attend through the standard paged path; the global
+            # keep_device_kv_cache gate only governs target layers.
+            return super()._execute_sparse_flash_attention_process(
+                ql_nope,
+                q_pe,
+                kv_cache,
+                topk_indices,
+                attn_metadata,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+                block_table=block_table,
+            )
 
         if attn_metadata.fused_copy_sfa_enabled:
             result = self._copy_sfa_attention(ql_nope, q_pe, topk_indices, attn_metadata, manager, layer_name)

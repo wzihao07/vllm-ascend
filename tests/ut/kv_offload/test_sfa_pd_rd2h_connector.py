@@ -1974,3 +1974,37 @@ def test_connector_reports_the_groups_its_scheduler_restores():
     connector.connector_scheduler.get_loaded_kv_cache_group_ids.return_value = (0, 1)
 
     assert connector.get_loaded_kv_cache_group_ids(MagicMock()) == (0, 1)
+
+
+def test_mf_meta_validation_accepts_resident_draft_layers():
+    # P announces its whole pull registry in MF_META, including the resident
+    # DSpark draft layers; D must accept those via the draft channel's
+    # registry instead of rejecting them as unknown.
+    thread = MembPullReadThread.__new__(MembPullReadThread)
+    thread._state = SimpleNamespace(
+        layer_metadata={"model.layers.0.self_attn.attn": object()},
+        dspark_draft_kv_metadata={"model.layers.78.self_attn.attn": object()},
+    )
+
+    both: dict[str, dict[str, list[int]]] = {
+        "model.layers.0.self_attn.attn": {},
+        "model.layers.78.self_attn.attn": {},
+    }
+    assert thread._unknown_mf_meta_layers({"model.layers.0.self_attn.attn": {}}) == set()
+    assert thread._unknown_mf_meta_layers({"model.layers.78.self_attn.attn": {}}) == set()
+    assert thread._unknown_mf_meta_layers(both) == set()
+    assert thread._unknown_mf_meta_layers({"model.layers.99.self_attn.attn": {}}) == {"model.layers.99.self_attn.attn"}
+
+    # The manager's resident set backs the validation up even when the draft
+    # channel's own registry was never configured.
+    thread._state.dspark_draft_kv_metadata = {}
+    thread._state.resident_layer_names = {"model.layers.78.self_attn.attn"}
+    assert thread._unknown_mf_meta_layers({"model.layers.78.self_attn.attn": {}}) == set()
+    assert thread._unknown_mf_meta_layers({"model.layers.99.self_attn.attn": {}}) == {"model.layers.99.self_attn.attn"}
+
+    # The manager's resident set backs the validation up even when the draft
+    # channel's own registry was never configured.
+    thread._state.dspark_draft_kv_metadata = {}
+    thread._state.resident_layer_names = {"model.layers.78.self_attn.attn"}
+    assert thread._unknown_mf_meta_layers({"model.layers.78.self_attn.attn": {}}) == set()
+    assert thread._unknown_mf_meta_layers({"model.layers.99.self_attn.attn": {}}) == {"model.layers.99.self_attn.attn"}

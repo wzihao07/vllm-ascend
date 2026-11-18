@@ -560,3 +560,30 @@ def test_current_kv_injection_uses_planner_linear_slots_and_sentinel():
     torch.testing.assert_close(selection_kv[0], torch.tensor([0.0, 1.0]))
     torch.testing.assert_close(selection_rope[0], torch.tensor([0.0]))
     assert scatter_op.call_count == 2
+
+
+def test_offload_layer_registered_skips_resident_draft_layers(monkeypatch):
+    # Resident DSpark draft layers (e.g. the MTP head) are deliberately
+    # absent from the offload registry; the copy-SFA row swaps must detect
+    # that and keep the paged preprocess/write path.
+    from vllm_ascend.attention import sfa_kv_offload as offload_module
+
+    manager = SimpleNamespace(
+        layer_name_to_offload_id={"model.layers.0.self_attn.attn": 0},
+        is_host_offloaded=lambda name: name == "model.layers.0.self_attn.attn",
+    )
+    monkeypatch.setattr(offload_module, "get_sparse_kv_offload_manager", lambda: manager)
+
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.layer_name = "model.layers.0.self_attn.attn"
+    assert impl._offload_layer_registered()
+
+    impl.layer_name = "model.layers.78.self_attn.attn"  # resident MTP head
+    assert not impl._offload_layer_registered()
+
+    impl.layer_name = None
+    impl._current_layer_name = "model.layers.0.self_attn.attn"
+    assert impl._offload_layer_registered()
+
+    impl._current_layer_name = None
+    assert not impl._offload_layer_registered()

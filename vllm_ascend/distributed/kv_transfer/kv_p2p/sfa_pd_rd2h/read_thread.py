@@ -66,6 +66,9 @@ class ConsumerReadState:
     block_size: int = 128
     dspark_context_receiver: DSparkContextReceiver | None = None
     dspark_draft_kv_metadata: dict[str, DraftKVCacheMetadata] = field(default_factory=dict)
+    # Manager-authoritative device-resident draft layers; independent of the
+    # draft channel's own registry being configured.
+    resident_layer_names: set[str] = field(default_factory=set)
     dspark_draft_blocks_by_req: dict[str, dict[int, tuple[int, ...]]] = field(default_factory=dict)
 
 
@@ -221,7 +224,7 @@ class MembPullReadThread(threading.Thread):
                         if not isinstance(p_session, str):
                             raise ValueError("MF_META session must be a string")
                         p_layer_meta = msgspec.msgpack.decode(msg[2])
-                        unknown_layers = set(p_layer_meta) - set(self._state.layer_metadata)
+                        unknown_layers = self._unknown_mf_meta_layers(p_layer_meta)
                         if unknown_layers:
                             raise ValueError(f"MF_META contains layers unknown to D: {sorted(unknown_layers)}")
                         if len(msg) == 3:
@@ -353,6 +356,21 @@ class MembPullReadThread(threading.Thread):
             if sock is not None:
                 sock.close(linger=0)
             ctx.destroy(linger=0)
+
+    def _unknown_mf_meta_layers(self, p_layer_meta: dict) -> set:
+        """Layers P announced that D can neither host-pull nor draft-transfer.
+
+        The main registry covers host-offload layers; resident DSpark draft
+        layers arrive through the DSPARK_DRAFT_KV channel (validated there
+        against dspark_draft_kv_metadata) and are recorded in the manager's
+        resident set — count both as known.
+        """
+        known = (
+            set(self._state.layer_metadata)
+            | set(self._state.dspark_draft_kv_metadata or {})
+            | set(getattr(self._state, "resident_layer_names", ()) or ())
+        )
+        return set(p_layer_meta) - known
 
     def _handle_dspark_draft_kv(self, identity, msg, sock, encoder) -> None:
         """Pull P-computed draft cache pages directly into D's resident pages."""

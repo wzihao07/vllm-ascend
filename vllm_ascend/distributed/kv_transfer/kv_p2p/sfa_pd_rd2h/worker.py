@@ -502,6 +502,7 @@ class SFAPDRD2HConsumerWorker:
             topk_hot_tokens=self._topk_hot_tokens,
             block_size=self._copy_sfa_block_size,
             dspark_draft_kv_metadata=self.dspark_draft_kv_metadata,
+            resident_layer_names=set(getattr(self.offload_manager, "resident_layer_names", ())),
             dspark_draft_blocks_by_req=self._dspark_draft_blocks_by_req,
         )
 
@@ -520,6 +521,20 @@ class SFAPDRD2HConsumerWorker:
         }
         if draft_names:
             self.dspark_draft_kv_metadata = build_draft_kv_metadata(self.kv_cache_config, kv_caches)
+        resident_names = set(getattr(self.offload_manager, "resident_layer_names", ()))
+        if resident_names and not draft_names:
+            logger.warning(
+                "MembPull D registry mismatch: %d manager-resident draft layers (%s ...) but no "
+                "DSpark draft registry; P's MF_META will carry layers this rank cannot accept.",
+                len(resident_names),
+                sorted(resident_names)[:2],
+            )
+        logger.info(
+            "MembPull D registry: %d host layers, %d draft layers, %d manager-resident layers.",
+            len(main_names),
+            len(draft_names),
+            len(resident_names),
+        )
 
         # Store layer info for MembPullReadThread
         self._main_names = main_names

@@ -70,7 +70,19 @@ def make_runner(load_hook_class, *, manager=None, has_prefill=False):
     runner_class = load_hook_class(
         "vllm_ascend/worker/v2/model_runner.py",
         "NPUModelRunner",
-        {"load_model", "execute_model", "gather_batch_req_state", "shutdown"},
+        {
+            "load_model",
+            "execute_model",
+            "gather_batch_req_state",
+            "shutdown",
+            # Sparse-offload D2H step hooks are called from execute_model.
+            "_sparse_kv_offload_d2h_enabled",
+            "_sparse_kv_offload_d2h_retire",
+            "_sparse_kv_offload_d2h_reset_preempted",
+            "_sparse_kv_offload_d2h_plan_launch",
+            "_sparse_kv_offload_d2h_record_source_ready",
+            "_maybe_send_draft_kv",
+        },
         Parent,
         {
             "torch": torch,

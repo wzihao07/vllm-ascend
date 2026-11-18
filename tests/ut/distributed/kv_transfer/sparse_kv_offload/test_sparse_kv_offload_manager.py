@@ -1691,3 +1691,16 @@ class TestDelayedD2HPlanner(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_layer_role_api_separates_host_and_resident_layers(self):
+        manager = self._manager()
+        manager.layer_name_to_offload_id = {"model.layers.0.self_attn.attn": 0}
+        manager.resident_layer_names = {"model.layers.78.self_attn.attn"}
+
+        self.assertTrue(manager.is_host_offloaded("model.layers.0.self_attn.attn"))
+        self.assertFalse(manager.is_resident_draft("model.layers.0.self_attn.attn"))
+        self.assertTrue(manager.is_resident_draft("model.layers.78.self_attn.attn"))
+        self.assertFalse(manager.is_host_offloaded("model.layers.78.self_attn.attn"))
+        # Unknown layers are neither role.
+        self.assertFalse(manager.is_host_offloaded("model.layers.99.self_attn.attn"))
+        self.assertFalse(manager.is_resident_draft("model.layers.99.self_attn.attn"))

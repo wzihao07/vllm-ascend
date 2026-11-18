@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.logger import logger
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.worker.dspark_utils import get_dspark_aux_layer_ids
@@ -157,7 +158,13 @@ def configure_dspark_kv_transfer(
     vllm_config: VllmConfig, speculator: Any, kv_cache_config: Any, *, is_last_pp_rank: bool
 ) -> None:
     """Register loaded draft ownership only for this backend's PD protocol."""
-    if not is_last_pp_rank or not uses_sfa_dspark_kv_transfer(vllm_config):
+    connector_eligible = uses_sfa_dspark_kv_transfer(vllm_config)
+    if not is_last_pp_rank or not connector_eligible:
+        logger.info(
+            "DSpark draft KV transfer not configured on this rank: last_pp_rank=%s, connector_eligible=%s.",
+            is_last_pp_rank,
+            connector_eligible,
+        )
         return
     if speculator is None:
         raise RuntimeError("DSpark KV transfer requires the loaded draft model on the final PP rank")
@@ -167,6 +174,7 @@ def configure_dspark_kv_transfer(
     connector = find_dspark_kv_connector(get_kv_transfer_group())
     kv_cache_config.dspark_draft_layer_names = names
     connector.configure_dspark_draft_layers(names)
+    logger.info("DSpark draft KV layers configured: %s", names)
 
 
 def bind_dspark_context_receiver(
