@@ -91,6 +91,10 @@ class AscendBlockTables(BlockTables):
         )
         self.kernel_block_sizes_tensor = torch.tensor(kernel_block_sizes, dtype=torch.int32, device=self.device)
         self._triton_block_size = 1024
+        # CPU mirror of one group's source block table for host-side
+        # planners (delayed D2H); enabled by enable_host_block_mirror().
+        self._host_block_mirror = None
+        self._host_block_mirror_group = None
         # kernel_block_sizes determine the number of block-table entries
         # touched by one token tile. Use the smallest kernel block size to
         # form one safe constexpr window for all groups, without staging a
@@ -127,7 +131,12 @@ class AscendBlockTables(BlockTables):
             [block_id * blocks_per_kv_block + k for block_id in ids for k in range(blocks_per_kv_block)]
             for ids, blocks_per_kv_block in zip(new_block_ids, self.blocks_per_kv_block)
         )
-        return super().append_block_ids(req_index, expanded_block_ids, overwrite)
+        ret = super().append_block_ids(req_index, expanded_block_ids, overwrite)
+        # Mirror the same write (super already advanced num_blocks).
+        mirror_group = getattr(self, "_host_block_mirror_group", None)
+        if mirror_group is not None:
+            self._mirror_block_ids(req_index, expanded_block_ids[mirror_group], overwrite)
+        return ret
 
     def compute_slot_mappings(
         self,

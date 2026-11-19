@@ -641,6 +641,7 @@ class AscendModelState(DefaultModelState):
             assert pool_slots is not None
             num_real_reqs = input_batch.num_reqs
             self.runner_plan_launch_d2h(
+                idx_mapping=input_batch.idx_mapping_np[:num_real_reqs],
                 computed_tokens=input_batch.num_computed_tokens_np[:num_real_reqs],
                 pool_slots=pool_slots.np[:num_real_reqs],
                 pool_generations=pool_generations.np[:num_real_reqs],

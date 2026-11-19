@@ -724,6 +724,21 @@ class NPUModelRunner(GPUModelRunner):
         """
         manager = self.sparse_kv_offload_manager
         assert manager is not None
+        # Block-table source: the CPU mirror (review [12]) when enabled and
+        # no divergence from the gathered table; otherwise the readback.
+        block_table = kwargs["block_table"]
+        mirror = getattr(getattr(self, "block_tables", None), "host_block_mirror", None)
+        idx_mapping = kwargs.get("idx_mapping")
+        if mirror is not None and idx_mapping is not None:
+            mirror_rows = mirror[np.maximum(idx_mapping, 0)]
+            if np.array_equal(block_table, mirror_rows):
+                block_table = mirror_rows
+            else:
+                logger.warning(
+                    "D2H block-table mirror diverged on %d/%d rows; using gathered table.",
+                    int(np.count_nonzero(np.any(block_table != mirror_rows, axis=1))),
+                    block_table.shape[0],
+                )
         count = manager.plan_d2h_requests(
             kwargs["computed_tokens"],
             kwargs["pool_slots"],
