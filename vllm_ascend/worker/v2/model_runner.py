@@ -714,36 +714,28 @@ class NPUModelRunner(GPUModelRunner):
         return len(slots)
 
     def _sparse_kv_offload_d2h_plan_launch(self, **kwargs) -> None:
-        """Freeze one full-block D2H batch and launch it (builder-tail hook).
+        """Freeze one full-block D2H batch and launch it.
 
-        Receives already-sliced host arrays from prepare_attn's local scope,
-        so the data is identical to the original inline placement. The
-        builder calls this via runner_plan_launch_d2h() — the transfer
-        logic lives in the runner (review [15]'s organization goal) while
-        the timing stays at the builder tail (field-proven at 32k/64k).
+        Reads the Host KV-cache group's block table from the CPU mirror
+        (review [12]) — zero synchronous device readback. The mirror is
+        maintained by AscendBlockTables.append_block_ids from the same
+        scheduler block-id stream the device table consumes, and this
+        runs at the builder tail where both are settled for the current
+        step.
         """
         manager = self.sparse_kv_offload_manager
         assert manager is not None
-        # Block-table source: the CPU mirror (review [12]) when enabled and
-        # no divergence from the gathered table; otherwise the readback.
-        block_table = kwargs["block_table"]
-        mirror = getattr(getattr(self, "block_tables", None), "host_block_mirror", None)
+        block_tables = getattr(self, "block_tables", None)
+        mirror = getattr(block_tables, "host_block_mirror", None) if block_tables else None
         idx_mapping = kwargs.get("idx_mapping")
-        if mirror is not None and idx_mapping is not None:
-            mirror_rows = mirror[np.maximum(idx_mapping, 0)]
-            if np.array_equal(block_table, mirror_rows):
-                block_table = mirror_rows
-            else:
-                logger.warning(
-                    "D2H block-table mirror diverged on %d/%d rows; using gathered table.",
-                    int(np.count_nonzero(np.any(block_table != mirror_rows, axis=1))),
-                    block_table.shape[0],
-                )
+        if mirror is None or idx_mapping is None:
+            return
+        host_block_table = mirror[np.maximum(idx_mapping, 0)]
         count = manager.plan_d2h_requests(
             kwargs["computed_tokens"],
             kwargs["pool_slots"],
             kwargs["pool_generations"],
-            kwargs["block_table"],
+            host_block_table,
             np.ones(kwargs["num_real_reqs"], dtype=np.bool_),
         )
         if count:

@@ -641,13 +641,10 @@ class AscendModelState(DefaultModelState):
             assert pool_slots is not None
             num_real_reqs = input_batch.num_reqs
             self.runner_plan_launch_d2h(
-                idx_mapping=input_batch.idx_mapping_np[:num_real_reqs],
                 computed_tokens=input_batch.num_computed_tokens_np[:num_real_reqs],
                 pool_slots=pool_slots.np[:num_real_reqs],
                 pool_generations=pool_generations.np[:num_real_reqs],
-                # V2 keeps block ids device-only (no CPU mirror); one
-                # small blocking D2H fetch is the planner's host input.
-                block_table=block_tables[manager.d2h_host_kv_cache_group_id][:num_real_reqs].cpu().numpy(),
+                idx_mapping=input_batch.idx_mapping_np[:num_real_reqs],
                 num_real_reqs=num_real_reqs,
             )
         return self.attn_metadata
