@@ -1863,3 +1863,48 @@ def test_connector_reports_the_groups_its_scheduler_restores():
     connector.connector_scheduler.get_loaded_kv_cache_group_ids.return_value = (0, 1)
 
     assert connector.get_loaded_kv_cache_group_ids(MagicMock()) == (0, 1)
+
+
+def test_cancelled_receive_completes_once_and_releases_row_once():
+    # Review [19]: the worker and scheduler completion handlers run together
+    # on the same completion — one terminal acknowledgement (finished_recving
+    # only), resident row released exactly once, duplicate re-delivery
+    # idempotent.
+    receiver = MagicMock()
+    receiver.get_descriptor.return_value = None
+    receiver.ready_requests.return_value = {"ext-req-cancel"}
+    worker = SFAPDRD2HConsumerWorker.__new__(SFAPDRD2HConsumerWorker)
+    worker.tp_size = 1
+    worker.tp_rank = 0
+    worker._terminal_ext_ids = {"ext-req-cancel"}
+    worker.request_map = {"ext-req-cancel": "req-cancel"}
+    worker._pending_done = set()
+    worker._invalid_block_ids = set()
+    worker._dest_blocks_by_req = {}
+    worker._dspark_context_receiver = receiver
+    worker._dspark_pending_recv = {"req-cancel"}
+    worker._deferred_finished_req_ids = set()
+    worker.offload_manager = MagicMock()
+    worker.offload_manager.d2h_slot_releasable.return_value = True
+    worker.copy_sfa_slots_by_req = {"req-cancel": 0}
+    cleanup_calls: list[set] = []
+
+    def _mock_cleanup(req_ids):
+        # Mirror the real cleanup: remove from deferred so the next step
+        # doesn't re-release the same request.
+        cleanup_calls.append(req_ids)
+        if isinstance(req_ids, set):
+            worker._deferred_finished_req_ids.difference_update(req_ids)
+
+    worker._cleanup_request_state = _mock_cleanup  # type: ignore[method-assign]
+
+    done_sending, done_recving = worker.get_finished({"req-cancel"})
+
+    assert done_recving == {"req-cancel"}
+    assert "req-cancel" not in done_sending
+    worker.offload_manager.release_d2h_slots.assert_called_once_with([0])
+    assert {"req-cancel"} in cleanup_calls
+
+    # Re-delivering the same acknowledgement stays idempotent.
+    worker.get_finished(set())
+    assert worker.offload_manager.release_d2h_slots.call_count == 1

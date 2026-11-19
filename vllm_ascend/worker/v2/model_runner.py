@@ -677,24 +677,41 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     def _sparse_kv_offload_d2h_retire(self, preempted_req_ids=None) -> int:
-        """Retire the previous delayed batch and fail loudly on preemption.
+        """Retire the previous delayed batch, then re-baseline preempted rows.
 
-        Preemption resets num_computed_tokens and releases KV blocks without
-        rebuilding resident tails, so it must be rejected until D2H grows a
-        restore protocol.
+        The retire drains the in-flight copy before the parent's state update
+        can reuse its source buffers. Preemption resets num_computed_tokens;
+        the preempted requests' ledger rows are released as the safe fallback
+        so their next prepare_attn re-adopts each row at the recomputed
+        frontier.
         """
         if not self._sparse_kv_offload_d2h_enabled():
             return 0
-        if preempted_req_ids:
-            preempted = ", ".join(sorted(preempted_req_ids))
-            raise RuntimeError(
-                "delayed D2H does not support scheduler preemption yet; "
-                "preemption resets num_computed_tokens and releases KV blocks "
-                f"without rebuilding resident tails (requests: {preempted})"
-            )
         manager = self.sparse_kv_offload_manager
         assert manager is not None
-        return manager.retire_d2h()
+        retired = manager.retire_d2h()
+        if preempted_req_ids:
+            self._sparse_kv_offload_d2h_reset_preempted(preempted_req_ids)
+        return retired
+
+    def _sparse_kv_offload_d2h_reset_preempted(self, preempted_req_ids) -> int:
+        model_state = self.model_state
+        pool_slots = getattr(model_state, "_offload_pool_slots", None)
+        input_batch = getattr(self, "input_batch", None)
+        mgr = self.sparse_kv_offload_manager
+        if pool_slots is None or input_batch is None or mgr is None:
+            return 0
+        if getattr(input_batch, "is_dummy", False):
+            return 0
+        num_real_reqs = input_batch.num_reqs
+        slot_by_req = {input_batch.req_ids[row]: int(pool_slots.np[row]) for row in range(num_real_reqs)}
+        slots = sorted(
+            {slot for req_id in preempted_req_ids if (slot := slot_by_req.get(req_id)) is not None and slot >= 0}
+        )
+        if not slots:
+            return 0
+        mgr.release_d2h_slots(slots)
+        return len(slots)
 
     def _sparse_kv_offload_d2h_plan_launch(self, **kwargs) -> None:
         """Freeze one full-block D2H batch and launch it (builder-tail hook).
