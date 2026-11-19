@@ -56,6 +56,7 @@ from vllm.v1.worker.gpu.model_runner import (
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
@@ -791,16 +792,32 @@ class NPUModelRunner(GPUModelRunner):
             return
         mirror = getattr(getattr(self, "block_tables", None), "host_block_mirror", None)
         idx_mapping = getattr(input_batch, "idx_mapping_np", None)
-        if mirror is not None and idx_mapping is not None:
-            # Batch-ordered gather from the CPU mirror of the last step's
-            # appends (idx_mapping maps batch rows to request slots, padding
-            # rows clamp to 0 exactly like the device gather): identical rows
-            # to the gathered device table, without a blocking D2H fetch.
-            host_block_table = mirror[np.maximum(idx_mapping[rows], 0)]
-        else:
-            # Mirror unavailable (enable_host_block_mirror never ran): keep
-            # the one-shot device readback rather than planning blind.
-            host_block_table = block_tables[manager.d2h_host_kv_cache_group_id][:num_real_reqs][rows].cpu().numpy()
+        # Field default: the synchronous device readback. The CPU mirror
+        # (review [12]) produced wrong destinations for settled rows too —
+        # not only the newly admitted ones the seen-set now defers — causing
+        # cascading SMMU faults on fused-attention reads of pool pages
+        # nobody mapped (32k prompts; 2k stayed under the dense-row path).
+        # Keep the mirror available behind VLLM_ASCEND_D2H_BLOCK_MIRROR=1
+        # with a divergence probe that logs any row where the two sources
+        # disagree, so the mirror can be re-validated with data instead of
+        # guesswork.
+        use_mirror = mirror is not None and idx_mapping is not None and envs.VLLM_ASCEND_D2H_BLOCK_MIRROR
+        host_block_table = block_tables[manager.d2h_host_kv_cache_group_id][:num_real_reqs][rows].cpu().numpy()
+        if use_mirror:
+            mirror_rows = mirror[np.maximum(idx_mapping[rows], 0)]
+            mismatch = np.any(host_block_table != mirror_rows, axis=1)
+            if np.any(mismatch):
+                bad = rows[np.flatnonzero(mismatch)][:4]
+                logger.warning(
+                    "D2H block-table mirror diverged from the gathered table on %d/%d rows "
+                    "(first batch rows %s, req_ids %s); planning from the gathered table.",
+                    int(np.count_nonzero(mismatch)),
+                    rows.size,
+                    bad.tolist(),
+                    [req_ids[int(i)] for i in bad],
+                )
+            else:
+                host_block_table = mirror_rows
         count = manager.plan_d2h_requests(
             input_batch.num_computed_tokens_np[rows],
             pool_slots.np[rows],

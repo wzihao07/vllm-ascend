@@ -92,6 +92,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Plan delayed D2H destinations from the CPU block-table mirror instead
+    # of the per-step device readback. Not sensitive; default "0" (readback)
+    # after the mirror produced wrong destinations on settled rows in the
+    # field. "1" enables the mirror plus a divergence probe that logs any
+    # row where the two sources disagree.
+    "VLLM_ASCEND_D2H_BLOCK_MIRROR": lambda: os.getenv("VLLM_ASCEND_D2H_BLOCK_MIRROR", "0") == "1",
 }
 
 # end-env-vars-definition

@@ -360,7 +360,7 @@ def test_host_block_mirror_tracks_appends_and_overwrites():
     assert mirror[1, :4].tolist() == [8, 6, 7, 9]
 
 
-def test_d2h_plan_launch_gathers_rows_from_host_mirror():
+def test_d2h_plan_launch_gathers_rows_from_host_mirror(monkeypatch):
     captured: dict[str, np.ndarray] = {}
     manager = MagicMock()
     manager.d2h_host_kv_cache_group_id = 0
@@ -379,13 +379,16 @@ def test_d2h_plan_launch_gathers_rows_from_host_mirror():
     # The planner defers rows admitted since the last boundary; pre-seed the
     # seen set so this call plans both rows.
     runner._d2h_planned_req_ids = {"req-a", "req-b"}
+    # The mirror is opt-in via env; enable it for this gather check.
+    monkeypatch.setattr("vllm_ascend.worker.v2.model_runner.envs.VLLM_ASCEND_D2H_BLOCK_MIRROR", True)
     runner.model_state = SimpleNamespace(
         # The plan slices the generations buffer, so it needs a real array.
         _offload_pool_generations=SimpleNamespace(np=np.array([4, 6])),
         _offload_pool_slots=SimpleNamespace(np=np.array([1, 0])),
-        # Deliberately no .cpu on the device table: reaching the readback
-        # fallback would raise, proving the plan consumed the mirror.
-        block_tables=(object(),),
+        # The readback line always runs as the divergence-probe baseline;
+        # model_state holds the BATCH-ORDERED gathered table (row i =
+        # source[idx_mapping[i]]), not the slot-ordered mirror.
+        block_tables=(torch.tensor([[10, 11, 12, 0, 0, 0], [20, 21, 0, 0, 0, 0]], dtype=torch.int32),),
     )
     runner.input_batch = SimpleNamespace(
         num_reqs=2,
@@ -401,6 +404,7 @@ def test_d2h_plan_launch_gathers_rows_from_host_mirror():
 
     # Padded rows map to -1 and clamp to slot 0, matching the device gather.
     runner.input_batch.idx_mapping_np = np.array([3, -1])
+    runner.model_state.block_tables = (torch.tensor([[20, 21, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]], dtype=torch.int32),)
     runner._sparse_kv_offload_d2h_plan_launch()
     assert captured["table"].tolist() == [[20, 21, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]]
 
@@ -420,8 +424,9 @@ def test_d2h_plan_launch_defers_newly_admitted_rows_one_boundary():
     runner.model_state = SimpleNamespace(
         _offload_pool_generations=SimpleNamespace(np=np.array([4, 6])),
         _offload_pool_slots=SimpleNamespace(np=np.array([1, 0])),
-        block_tables=(object(),),
+        block_tables=(torch.zeros(2, 6, dtype=torch.int32),),
     )
+    manager.d2h_host_kv_cache_group_id = 0
 
     def batch(ids):
         return SimpleNamespace(
