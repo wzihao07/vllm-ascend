@@ -80,6 +80,9 @@ class AscendModelState(DefaultModelState):
     kvpp_is_dummy_run: bool = False
     device_metadata: "TargetDeviceMetadata | None" = None
 
+    def runner_plan_launch_d2h(self, **kwargs) -> None:
+        """Runner-assigned hook: plan and launch the delayed D2H batch."""
+
     def finish_execution(self, *, failed: bool) -> None:
         """Join auxiliary metadata work even if input preparation failed."""
         if self.device_metadata is not None:
@@ -630,27 +633,20 @@ class AscendModelState(DefaultModelState):
                 if getattr(metadata, "copy_sfa_copy_src_offsets", None) is not None:
                     manager.restore_copy_sfa_tails(metadata)
                     break
-        # Delayed D2H: freeze this step's full-block plan and launch the
-        # previous one right after metadata is built, so the async copy
-        # overlaps the upcoming forward. The manager getter raises on
-        # non-sparse nodes (e.g. the PD producer), so only query it when the
-        # fused copy-sfa request states were prepared for this batch.
+        # Delayed D2H: freeze this step's full-block plan and launch it
+        # via the runner hook (logic in the runner, data from this scope —
+        # same pattern as restore/dense-fill/initialize above).
         if request_states is not None and not getattr(input_batch, "is_dummy", False) and pool_generations is not None:
             manager = get_sparse_kv_offload_manager()
             assert pool_slots is not None
             num_real_reqs = input_batch.num_reqs
-            count = manager.plan_d2h_requests(
-                input_batch.num_computed_tokens_np[:num_real_reqs],
-                pool_slots.np[:num_real_reqs],
-                pool_generations.np[:num_real_reqs],
+            self.runner_plan_launch_d2h(
+                computed_tokens=input_batch.num_computed_tokens_np[:num_real_reqs],
+                pool_slots=pool_slots.np[:num_real_reqs],
+                pool_generations=pool_generations.np[:num_real_reqs],
                 # V2 keeps block ids device-only (no CPU mirror); one
                 # small blocking D2H fetch is the planner's host input.
-                block_tables[manager.d2h_host_kv_cache_group_id][:num_real_reqs].cpu().numpy(),
-                np.ones(num_real_reqs, dtype=np.bool_),
+                block_table=block_tables[manager.d2h_host_kv_cache_group_id][:num_real_reqs].cpu().numpy(),
+                num_real_reqs=num_real_reqs,
             )
-            if count:
-                # All TP ranks freeze and launch the same host plan. Only
-                # TP0 issues the physical copy; other ranks mark the batch
-                # submitted to join the matching retire collective.
-                manager.launch_d2h()
         return self.attn_metadata

@@ -500,6 +500,7 @@ class NPUModelRunner(GPUModelRunner):
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
                 self.vllm_config, kv_cache_config, sparse_cfg
             )
+            self.model_state.runner_plan_launch_d2h = self._sparse_kv_offload_d2h_plan_launch
             self.model_state._offload_live_req_ids = self.req_states.req_id_to_index
             self.model_state._offload_draft_layer_names = (
                 getattr(self.speculator, "draft_attn_layer_names", set[str]()) - resident_draft_names
@@ -694,6 +695,27 @@ class NPUModelRunner(GPUModelRunner):
         manager = self.sparse_kv_offload_manager
         assert manager is not None
         return manager.retire_d2h()
+
+    def _sparse_kv_offload_d2h_plan_launch(self, **kwargs) -> None:
+        """Freeze one full-block D2H batch and launch it (builder-tail hook).
+
+        Receives already-sliced host arrays from prepare_attn's local scope,
+        so the data is identical to the original inline placement. The
+        builder calls this via runner_plan_launch_d2h() — the transfer
+        logic lives in the runner (review [15]'s organization goal) while
+        the timing stays at the builder tail (field-proven at 32k/64k).
+        """
+        manager = self.sparse_kv_offload_manager
+        assert manager is not None
+        count = manager.plan_d2h_requests(
+            kwargs["computed_tokens"],
+            kwargs["pool_slots"],
+            kwargs["pool_generations"],
+            kwargs["block_table"],
+            np.ones(kwargs["num_real_reqs"], dtype=np.bool_),
+        )
+        if count:
+            manager.launch_d2h()
 
     def _sparse_kv_offload_d2h_record_source_ready(self) -> bool:
         if not self._sparse_kv_offload_d2h_enabled():
