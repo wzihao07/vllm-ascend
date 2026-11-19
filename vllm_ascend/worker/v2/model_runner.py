@@ -744,10 +744,12 @@ class NPUModelRunner(GPUModelRunner):
         the builder is called. The plan reads the snapshot settled by the
         previous prepare_attn (this step's settle runs later, inside the
         forward's input prep), so each block's copy starts one step later
-        than the old builder-tail placement. Zero-scheduled-token steps
-        skip prepare_attn upstream but still retire/plan/launch here on
-        the unchanged snapshot. The async copy still overlaps the upcoming
-        forward.
+        than the old builder-tail placement; rows admitted this step are
+        deferred one further boundary (their admission state is not
+        settled yet — see the seen-set note in the body). Zero-scheduled-
+        token steps skip prepare_attn upstream but still retire/plan/
+        launch here on the unchanged snapshot. The async copy still
+        overlaps the upcoming forward.
         """
         if not self._sparse_kv_offload_d2h_enabled():
             return
@@ -769,6 +771,24 @@ class NPUModelRunner(GPUModelRunner):
         manager = self.sparse_kv_offload_manager
         assert manager is not None
         num_real_reqs = input_batch.num_reqs
+        req_ids = list(input_batch.req_ids[:num_real_reqs])
+        # Rows admitted since the last plan have no settled state at this
+        # boundary: their admission block appends and pool-row binding run
+        # inside this step's forward preparation, so every row input (block
+        # table, pool slots, generations, computed tokens) still holds the
+        # previous slot occupant's data or zeros. Planning them here stages
+        # garbage destinations into the D2H descriptors; defer them to the
+        # next boundary instead. One step of delay is harmless — PD prompt
+        # KV arrives via the pull path, so the D2H batch only carries
+        # decode-produced blocks, which stay in the resident tail meanwhile.
+        seen = getattr(self, "_d2h_planned_req_ids", None)
+        if seen is None:
+            seen = self._d2h_planned_req_ids = set()
+        rows = np.asarray([i for i, req_id in enumerate(req_ids) if req_id in seen], dtype=np.int64)
+        seen.clear()
+        seen.update(req_ids)
+        if rows.size == 0:
+            return
         mirror = getattr(getattr(self, "block_tables", None), "host_block_mirror", None)
         idx_mapping = getattr(input_batch, "idx_mapping_np", None)
         if mirror is not None and idx_mapping is not None:
@@ -776,17 +796,17 @@ class NPUModelRunner(GPUModelRunner):
             # appends (idx_mapping maps batch rows to request slots, padding
             # rows clamp to 0 exactly like the device gather): identical rows
             # to the gathered device table, without a blocking D2H fetch.
-            host_block_table = mirror[np.maximum(idx_mapping[:num_real_reqs], 0)]
+            host_block_table = mirror[np.maximum(idx_mapping[rows], 0)]
         else:
             # Mirror unavailable (enable_host_block_mirror never ran): keep
             # the one-shot device readback rather than planning blind.
-            host_block_table = block_tables[manager.d2h_host_kv_cache_group_id][:num_real_reqs].cpu().numpy()
+            host_block_table = block_tables[manager.d2h_host_kv_cache_group_id][:num_real_reqs][rows].cpu().numpy()
         count = manager.plan_d2h_requests(
-            input_batch.num_computed_tokens_np[:num_real_reqs],
-            pool_slots.np[:num_real_reqs],
-            pool_generations.np[:num_real_reqs],
+            input_batch.num_computed_tokens_np[rows],
+            pool_slots.np[rows],
+            pool_generations.np[rows],
             host_block_table,
-            np.ones(num_real_reqs, dtype=np.bool_),
+            np.ones(rows.size, dtype=np.bool_),
         )
         if count:
             # All TP ranks freeze and launch the same host plan. Only TP0

@@ -376,6 +376,9 @@ def test_d2h_plan_launch_gathers_rows_from_host_mirror():
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.sparse_kv_offload_manager = manager
     runner.block_tables = SimpleNamespace(host_block_mirror=mirror)
+    # The planner defers rows admitted since the last boundary; pre-seed the
+    # seen set so this call plans both rows.
+    runner._d2h_planned_req_ids = {"req-a", "req-b"}
     runner.model_state = SimpleNamespace(
         # The plan slices the generations buffer, so it needs a real array.
         _offload_pool_generations=SimpleNamespace(np=np.array([4, 6])),
@@ -400,3 +403,45 @@ def test_d2h_plan_launch_gathers_rows_from_host_mirror():
     runner.input_batch.idx_mapping_np = np.array([3, -1])
     runner._sparse_kv_offload_d2h_plan_launch()
     assert captured["table"].tolist() == [[20, 21, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]]
+
+
+def test_d2h_plan_launch_defers_newly_admitted_rows_one_boundary():
+    calls: list[list[str]] = []
+    manager = MagicMock()
+
+    def _capture_plan(computed, slots, generations, table, active):
+        calls.append([str(i) for i in range(int(active.sum()))])
+        return 0
+
+    manager.plan_d2h_requests.side_effect = _capture_plan
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.sparse_kv_offload_manager = manager
+    runner.block_tables = SimpleNamespace(host_block_mirror=np.zeros((4, 6), dtype=np.int32))
+    runner.model_state = SimpleNamespace(
+        _offload_pool_generations=SimpleNamespace(np=np.array([4, 6])),
+        _offload_pool_slots=SimpleNamespace(np=np.array([1, 0])),
+        block_tables=(object(),),
+    )
+
+    def batch(ids):
+        return SimpleNamespace(
+            num_reqs=len(ids),
+            req_ids=list(ids),
+            num_computed_tokens_np=np.array([100] * len(ids), dtype=np.int64),
+            idx_mapping_np=np.arange(len(ids)),
+        )
+
+    # First boundary after startup: nothing is settled yet, nothing plans.
+    runner.input_batch = batch(["req-a"])
+    runner._sparse_kv_offload_d2h_plan_launch()
+    assert calls == []
+
+    # A request admitted this boundary is deferred even alongside a settled one.
+    runner.input_batch = batch(["req-a", "req-b"])
+    runner._sparse_kv_offload_d2h_plan_launch()
+    assert calls == [["0"]]
+
+    # Next boundary both are settled and both plan.
+    runner.input_batch = batch(["req-a", "req-b"])
+    runner._sparse_kv_offload_d2h_plan_launch()
+    assert calls == [["0"], ["0", "1"]]
