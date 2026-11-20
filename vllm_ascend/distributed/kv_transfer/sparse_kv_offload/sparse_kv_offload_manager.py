@@ -549,11 +549,6 @@ class SparseKVOffloadManager:
         decode_width = 1
         if vllm_config.speculative_config is not None:
             decode_width += vllm_config.speculative_config.num_speculative_tokens
-        # CPU-side num_computed_tokens is an optimistic upper bound (draft
-        # tokens count before MTP rejection). Full-block eligibility waits
-        # one decode width beyond the block edge so the optimistic head
-        # never decides the copy; the settled tail is always steady tokens.
-        self.d2h_ready_margin = decode_width - 1
         # Device-resident DSpark draft layers (paged KV, direct transfer).
         # Populated by the runner after init; every consumer asks the role
         # API below instead of re-deriving registry membership.
@@ -2038,12 +2033,10 @@ class SparseKVOffloadManager:
         lag = active_computed - stable_prefixes
         if np.any(lag < 0):
             raise RuntimeError("delayed D2H stable prefix is ahead of num_computed_tokens")
-        # The optimistic head inflates lag by at most d2h_ready_margin, so
-        # the two-unretired-blocks guard uses the widened steady bound too.
-        if np.any(lag >= 2 * self.block_size + self.d2h_ready_margin):
+        if np.any(lag >= 2 * self.block_size):
             raise RuntimeError("delayed D2H planner observed two unretired full blocks")
 
-        ready_in_active = lag >= self.block_size + self.d2h_ready_margin
+        ready_in_active = lag >= self.block_size
         if not np.any(ready_in_active):
             return 0
         ready_slots = active_slots[ready_in_active]
@@ -2240,21 +2233,3 @@ def d2h_record_source_ready(runner) -> bool:
     if not d2h_enabled(runner):
         return False
     return runner.sparse_kv_offload_manager.record_d2h_source_ready()
-
-
-def make_d2h_plan_launch_hook(runner):
-    """Create a bound plan/launch function for the builder to call."""
-
-    def hook(**kwargs) -> None:
-        manager = runner.sparse_kv_offload_manager
-        count = manager.plan_d2h_requests(
-            kwargs["computed_tokens"],
-            kwargs["pool_slots"],
-            kwargs["pool_generations"],
-            kwargs["block_table"],
-            np.ones(kwargs["num_real_reqs"], dtype=np.bool_),
-        )
-        if count:
-            manager.launch_d2h()
-
-    return hook

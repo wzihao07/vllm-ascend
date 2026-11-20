@@ -96,7 +96,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     d2h_record_source_ready,
     d2h_retire,
     init_sparse_kv_offload_manager,
-    make_d2h_plan_launch_hook,
 )
 from vllm_ascend.hisparse.host_mirror import HostMirrorConnector, overlap_target_host_mirror
 from vllm_ascend.kv_trace.kv_trace_runner import install_trace
@@ -508,7 +507,6 @@ class NPUModelRunner(GPUModelRunner):
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
                 self.vllm_config, kv_cache_config, sparse_cfg
             )
-            self.model_state.runner_plan_launch_d2h = make_d2h_plan_launch_hook(self)
             self.model_state._offload_live_req_ids = self.req_states.req_id_to_index
             self.model_state._offload_draft_layer_names = (
                 getattr(self.speculator, "draft_attn_layer_names", set[str]()) - resident_draft_names
