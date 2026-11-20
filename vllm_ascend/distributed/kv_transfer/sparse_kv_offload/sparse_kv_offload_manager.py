@@ -2180,39 +2180,3 @@ def init_sparse_kv_offload_manager(
 def get_sparse_kv_offload_manager():
     assert _SPARSE_KV_OFFLOAD_MANAGER is not None, "KV offload manager is not initialized."
     return _SPARSE_KV_OFFLOAD_MANAGER
-
-
-# ===== Runner-side hooks for the delayed batch D2H pipeline =====
-# NPUModelRunner delegates here; its own diff stays minimal.
-
-
-def d2h_enabled(runner) -> bool:
-    """Whether the delayed D2H pipeline is active on this runner."""
-    model_state = getattr(runner, "model_state", None)
-    return (
-        getattr(runner, "sparse_kv_offload_manager", None) is not None
-        and model_state is not None
-        and getattr(model_state, "_offload_pool_generations", None) is not None
-    )
-
-
-def d2h_retire(runner, preempted_req_ids=None) -> int:
-    """Retire the previous delayed batch; reject preemptions until D2H
-    preemption has a restore protocol."""
-    if not d2h_enabled(runner):
-        return 0
-    if preempted_req_ids:
-        preempted = ", ".join(sorted(preempted_req_ids))
-        raise RuntimeError(
-            "delayed D2H does not support scheduler preemption yet; "
-            "preemption resets num_computed_tokens and releases KV blocks "
-            f"without rebuilding resident tails (requests: {preempted})"
-        )
-    return runner.sparse_kv_offload_manager.retire_d2h()
-
-
-def d2h_record_source_ready(runner) -> bool:
-    """Record the current compute frontier as the D2H source-ready event."""
-    if not d2h_enabled(runner):
-        return False
-    return runner.sparse_kv_offload_manager.record_d2h_source_ready()
