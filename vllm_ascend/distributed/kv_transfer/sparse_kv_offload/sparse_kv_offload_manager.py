@@ -2197,35 +2197,18 @@ def d2h_enabled(runner) -> bool:
 
 
 def d2h_retire(runner, preempted_req_ids=None) -> int:
-    """Retire the previous delayed batch, then re-baseline preempted rows."""
+    """Retire the previous delayed batch; reject preemptions until D2H
+    preemption has a restore protocol."""
     if not d2h_enabled(runner):
         return 0
-    manager = runner.sparse_kv_offload_manager
-    retired = manager.retire_d2h()
     if preempted_req_ids:
-        _d2h_reset_preempted(runner, preempted_req_ids)
-    return retired
-
-
-def _d2h_reset_preempted(runner, preempted_req_ids) -> int:
-    """Invalidate the D2H ledger rows of preempted requests."""
-    model_state = runner.model_state
-    pool_slots = getattr(model_state, "_offload_pool_slots", None)
-    input_batch = getattr(runner, "input_batch", None)
-    manager = runner.sparse_kv_offload_manager
-    if pool_slots is None or input_batch is None or manager is None:
-        return 0
-    if getattr(input_batch, "is_dummy", False):
-        return 0
-    num_real_reqs = input_batch.num_reqs
-    slot_by_req = {input_batch.req_ids[row]: int(pool_slots.np[row]) for row in range(num_real_reqs)}
-    slots = sorted(
-        {slot for req_id in preempted_req_ids if (slot := slot_by_req.get(req_id)) is not None and slot >= 0}
-    )
-    if not slots:
-        return 0
-    manager.release_d2h_slots(slots)
-    return len(slots)
+        preempted = ", ".join(sorted(preempted_req_ids))
+        raise RuntimeError(
+            "delayed D2H does not support scheduler preemption yet; "
+            "preemption resets num_computed_tokens and releases KV blocks "
+            f"without rebuilding resident tails (requests: {preempted})"
+        )
+    return runner.sparse_kv_offload_manager.retire_d2h()
 
 
 def d2h_record_source_ready(runner) -> bool:

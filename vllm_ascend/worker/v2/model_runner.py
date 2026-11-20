@@ -395,7 +395,10 @@ class NPUModelRunner(GPUModelRunner):
         state = self.execute_model_state
         self._lmhead_pad_size = self._get_lmhead_pad_size(state) if state is not None and lmhead_tp_enable() else None
         output = super().sample_tokens(grammar_output)
-        d2h_record_source_ready(self)
+        if self.speculative_config is not None:
+            # MTP proposal (inside the upstream sample_tokens) is the last
+            # possible KV writer in this outer iteration.
+            d2h_record_source_ready(self)
         self._lmhead_pad_size = None
         # Close the per-step msprobe dump cycle on the normal last-PP-rank
         # path (v1 parity: v1 finalizes at the end of sample_tokens).
@@ -799,6 +802,11 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.model.compute_logits(self.execute_model_state.hidden_states[dummy_indices])
         self.kvpp.complete_forward()
+        if self.speculative_config is None:
+            # Target forward is the final KV writer when speculative proposal
+            # does not run; MTP records the frontier in sample_tokens() after
+            # all draft steps instead.
+            d2h_record_source_ready(self)
 
         if dump_forward:
             if dummy_run:
